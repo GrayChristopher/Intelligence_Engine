@@ -18,7 +18,7 @@ REJECTED_FILE = DATA_DIR / "rejected_sources.json"
 
 
 # =========================================================
-# THRESHOLDS
+# CONFIG
 # =========================================================
 
 MIN_CONFIDENCE = 0.80
@@ -29,8 +29,38 @@ MIN_EXTRACT_CONFIDENCE = 0.80
 # HELPERS
 # =========================================================
 
-def save_json(path, payload):
-    with open(path, "w", encoding="utf-8") as file:
+def load_input():
+
+    if not INPUT_FILE.exists():
+        raise FileNotFoundError(
+            f"Missing input file: {INPUT_FILE}"
+        )
+
+    with open(
+        INPUT_FILE,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        return json.load(file)
+
+
+def write_output(
+    path: Path,
+    state: str,
+    sources: list,
+):
+
+    payload = {
+        "state": state,
+        "sources": sources,
+    }
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
         json.dump(
             payload,
             file,
@@ -39,110 +69,218 @@ def save_json(path, payload):
         )
 
 
-def route_source(source):
-    """
-    Deterministic routing.
+def get_source_type(source: dict):
 
-    AI classifies the source.
-    This function decides what the system trusts.
-    """
+    # Current schema from 01_source_discovery_agent.py
+    source_type = source.get("source_type")
 
-    icp = source.get("icp_relevance")
-    extractability = source.get("extractability")
+    # Backward compatibility with older schema
+    if not source_type:
+        source_type = source.get("extractability")
 
-    confidence = source.get("confidence", 0)
-    extract_confidence = source.get(
-        "extractability_confidence",
-        0,
+    return source_type or "UNKNOWN"
+
+
+# =========================================================
+# ROUTING
+# =========================================================
+
+def route_source(source: dict):
+
+    icp = (
+        source.get(
+            "icp_relevance",
+            "OUT_OF_SCOPE",
+        )
+        or "OUT_OF_SCOPE"
+    ).upper()
+
+    source_type = (
+        get_source_type(source)
+        or "UNKNOWN"
+    ).upper()
+
+    confidence = float(
+        source.get(
+            "confidence",
+            0.0,
+        )
+        or 0.0
     )
 
-    contains_haulers = source.get(
-        "likely_contains_haulers",
-        False,
+    extract_confidence = float(
+        source.get(
+            "extractability_confidence",
+            0.0,
+        )
+        or 0.0
+    )
+
+    likely_contains_haulers = bool(
+        source.get(
+            "likely_contains_haulers",
+            False,
+        )
     )
 
     # -----------------------------------------------------
-    # REJECT
+    # OUT OF SCOPE
     # -----------------------------------------------------
 
     if icp == "OUT_OF_SCOPE":
-        return "REJECTED", "Source is outside the target ICP."
 
-    # -----------------------------------------------------
-    # RESOLUTION
-    # -----------------------------------------------------
-
-    if (
-        icp == "CORE"
-        and extractability == "HUB"
-    ):
         return (
-            "RESOLUTION",
-            "Relevant source hub requires underlying list/database resolution."
+            "REJECTED",
+            "Source is outside the target ICP.",
         )
 
     # -----------------------------------------------------
-    # EXTRACTABLE
-    # -----------------------------------------------------
-
-    if (
-        icp == "CORE"
-        and extractability in {
-            "DIRECT_LIST",
-            "DATABASE",
-        }
-        and contains_haulers is True
-        and confidence >= MIN_CONFIDENCE
-        and extract_confidence >= MIN_EXTRACT_CONFIDENCE
-    ):
-        return (
-            "EXTRACTABLE",
-            "High-confidence CORE source suitable for company extraction."
-        )
-
-    # -----------------------------------------------------
-    # REVIEW
+    # ADJACENT ICP
     # -----------------------------------------------------
 
     if icp == "ADJACENT":
+
         return (
             "REVIEW",
-            "Adjacent ICP source requires optional/manual inclusion decision."
+            (
+                "Adjacent ICP source requires "
+                "optional/manual inclusion decision."
+            ),
         )
 
-    if extractability == "REQUIREMENTS_PAGE":
+    # -----------------------------------------------------
+    # CORE HUB
+    # -----------------------------------------------------
+
+    if (
+        icp == "CORE"
+        and source_type == "HUB"
+        and confidence >= MIN_CONFIDENCE
+    ):
+
         return (
-            "REVIEW",
-            "Requirements page does not directly provide company records."
+            "RESOLUTION",
+            (
+                "Relevant source hub requires resolution "
+                "to an underlying extractable dataset."
+            ),
         )
 
-    if extractability == "UNKNOWN":
+    # -----------------------------------------------------
+    # CORE DIRECTLY EXTRACTABLE
+    # -----------------------------------------------------
+
+    if (
+        icp == "CORE"
+        and source_type in {
+            "DIRECT_LIST",
+            "DATABASE",
+        }
+        and likely_contains_haulers
+        and confidence >= MIN_CONFIDENCE
+        and extract_confidence
+        >= MIN_EXTRACT_CONFIDENCE
+    ):
+
+        return (
+            "EXTRACTABLE",
+            (
+                "Core ICP source meets deterministic "
+                "confidence and extractability rules."
+            ),
+        )
+
+    # -----------------------------------------------------
+    # REQUIREMENTS / POLICY PAGE
+    # -----------------------------------------------------
+
+    if source_type == "REQUIREMENTS_PAGE":
+
         return (
             "REVIEW",
-            "Extractability is uncertain."
+            (
+                "Relevant requirements page does not "
+                "directly provide extractable hauler records."
+            ),
         )
+
+    # -----------------------------------------------------
+    # CONTRACT RECORDS
+    # -----------------------------------------------------
+
+    if source_type == "CONTRACT_RECORDS":
+
+        return (
+            "REVIEW",
+            (
+                "Contract records may contain useful "
+                "operators but require additional review."
+            ),
+        )
+
+    # -----------------------------------------------------
+    # LOW CONFIDENCE
+    # -----------------------------------------------------
 
     if confidence < MIN_CONFIDENCE:
+
         return (
             "REVIEW",
-            f"Overall confidence below threshold ({MIN_CONFIDENCE:.2f})."
+            (
+                f"Source confidence {confidence:.2f} "
+                f"is below threshold "
+                f"{MIN_CONFIDENCE:.2f}."
+            ),
         )
 
-    if extract_confidence < MIN_EXTRACT_CONFIDENCE:
+    if (
+        source_type
+        in {
+            "DIRECT_LIST",
+            "DATABASE",
+        }
+        and extract_confidence
+        < MIN_EXTRACT_CONFIDENCE
+    ):
+
         return (
             "REVIEW",
-            f"Extractability confidence below threshold ({MIN_EXTRACT_CONFIDENCE:.2f})."
+            (
+                f"Extractability confidence "
+                f"{extract_confidence:.2f} "
+                f"is below threshold "
+                f"{MIN_EXTRACT_CONFIDENCE:.2f}."
+            ),
         )
 
-    if contains_haulers is not True:
+    if (
+        source_type
+        in {
+            "DIRECT_LIST",
+            "DATABASE",
+        }
+        and not likely_contains_haulers
+    ):
+
         return (
             "REVIEW",
-            "Source does not confidently indicate identifiable hauler records."
+            (
+                "Source structure may be extractable, "
+                "but it is not sufficiently clear that "
+                "it contains private hauler records."
+            ),
         )
+
+    # -----------------------------------------------------
+    # DEFAULT
+    # -----------------------------------------------------
 
     return (
         "REVIEW",
-        "Source does not meet deterministic extraction rules."
+        (
+            "Source does not meet deterministic "
+            "extraction rules."
+        ),
     )
 
 
@@ -158,20 +296,17 @@ def main():
     print("SOURCE ROUTER")
     print("=" * 72)
 
-    if not INPUT_FILE.exists():
-        raise FileNotFoundError(
-            f"Missing input file: {INPUT_FILE}"
-        )
+    payload = load_input()
 
-    with open(
-        INPUT_FILE,
-        "r",
-        encoding="utf-8",
-    ) as file:
-        payload = json.load(file)
+    state = payload.get(
+        "state",
+        "UNKNOWN",
+    )
 
-    state = payload.get("state", "UNKNOWN")
-    sources = payload.get("sources", [])
+    sources = payload.get(
+        "sources",
+        [],
+    )
 
     extractable = []
     resolution = []
@@ -180,46 +315,65 @@ def main():
 
     print()
     print(f"State: {state}")
-    print(f"Sources received: {len(sources)}")
+    print(
+        f"Sources received: "
+        f"{len(sources)}"
+    )
     print()
 
-    for number, source in enumerate(
+    for index, source in enumerate(
         sources,
         start=1,
     ):
 
-        route, reason = route_source(source)
+        route, reason = route_source(
+            source
+        )
 
         routed_source = dict(source)
 
-        routed_source["routing_status"] = route
-        routed_source["routing_reason"] = reason
+        # Normalize the source type so downstream scripts
+        # always have the current field available.
+        routed_source["source_type"] = (
+            get_source_type(source)
+        )
+
+        routed_source["route"] = route
+        routed_source["route_reason"] = reason
 
         if route == "EXTRACTABLE":
-            extractable.append(routed_source)
+            extractable.append(
+                routed_source
+            )
 
         elif route == "RESOLUTION":
-            resolution.append(routed_source)
+            resolution.append(
+                routed_source
+            )
 
         elif route == "REJECTED":
-            rejected.append(routed_source)
+            rejected.append(
+                routed_source
+            )
 
         else:
-            review.append(routed_source)
+            review.append(
+                routed_source
+            )
 
         print(
-            f"{number}. "
+            f"{index}. "
             f"{source.get('source_name', 'UNKNOWN')}"
         )
 
         print(
             f"   ICP:            "
-            f"{source.get('icp_relevance')}"
+            f"{source.get('icp_relevance', 'UNKNOWN')}"
         )
 
         print(
             f"   Extractability: "
-            f"{source.get('extractability')}"
+            f"{get_source_type(source)}"
         )
 
         print(
@@ -234,87 +388,75 @@ def main():
 
         print()
 
-    # -----------------------------------------------------
-    # SAVE OUTPUTS
-    # -----------------------------------------------------
-
-    save_json(
+    write_output(
         EXTRACTABLE_FILE,
-        {
-            "state": state,
-            "sources": extractable,
-        },
+        state,
+        extractable,
     )
 
-    save_json(
+    write_output(
         RESOLUTION_FILE,
-        {
-            "state": state,
-            "sources": resolution,
-        },
+        state,
+        resolution,
     )
 
-    save_json(
+    write_output(
         REVIEW_FILE,
-        {
-            "state": state,
-            "sources": review,
-        },
+        state,
+        review,
     )
 
-    save_json(
+    write_output(
         REJECTED_FILE,
-        {
-            "state": state,
-            "sources": rejected,
-        },
+        state,
+        rejected,
     )
-
-    # -----------------------------------------------------
-    # SUMMARY
-    # -----------------------------------------------------
 
     print("=" * 72)
-    print("ROUTING COMPLETE")
+    print("SOURCE ROUTING COMPLETE")
     print("=" * 72)
 
     print()
     print(
-        f"READY FOR EXTRACTION: "
+        f"EXTRACTABLE: "
         f"{len(extractable)}"
     )
 
     print(
-        f"NEEDS RESOLUTION:     "
+        f"RESOLUTION:  "
         f"{len(resolution)}"
     )
 
     print(
-        f"REVIEW:               "
+        f"REVIEW:      "
         f"{len(review)}"
     )
 
     print(
-        f"REJECTED:             "
+        f"REJECTED:    "
         f"{len(rejected)}"
     )
 
     print()
 
     print(
-        f"Saved: {EXTRACTABLE_FILE}"
+        "Saved:"
     )
 
     print(
-        f"Saved: {RESOLUTION_FILE}"
+        "  data/extractable_sources.json"
     )
 
     print(
-        f"Saved: {REVIEW_FILE}"
+        "  data/resolution_sources.json"
     )
 
     print(
-        f"Saved: {REJECTED_FILE}"
+        "  data/review_sources.json"
+    )
+
+    print(
+        "  data/rejected_sources.json"
     )
 
     print()
