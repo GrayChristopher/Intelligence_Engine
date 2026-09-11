@@ -1,498 +1,525 @@
 # Hauler Intelligence Engine
 
-A prototype market-intelligence pipeline for discovering, researching, validating, and ranking private waste-hauling companies by geography.
+An agentic market intelligence pipeline for discovering, researching, validating, and ranking waste haulers by geography.
 
-The system combines agentic research for ambiguous discovery/research tasks with deterministic Python for validation, routing, and ICP scoring.
+The prototype combines **AI-driven research** with **deterministic validation and scoring**. Agentic workflows handle ambiguous research tasks, while Python handles business rules, validation, and ICP ranking.
 
-Core design principle:
-Use AI where the research path is ambiguous. Use deterministic systems where reproducibility, trust, and business rules matter.
+> **The agent handles ambiguity. Python handles trust.**
 
-WHAT IT DOES
+---
 
-Given a U.S. state, the pipeline:
+## Pipeline
 
-1. Uses AI-assisted web research to discover authoritative public data sources.
-2. Classifies those sources by ICP relevance and extractability.
-3. Extracts source-backed private waste-service companies.
-4. Researches company websites, service lines, and scale signals.
-5. Validates records using deterministic rules.
-6. Scores and ranks companies against the target ICP.
-7. Outputs ranked JSON and CSV datasets.
-
-ARCHITECTURE
-
-STATE INPUT
+```text
+U.S. state
     ↓
-01 AI SOURCE DISCOVERY
-    ↓
-02 DETERMINISTIC SOURCE ROUTING
-    ↓
-03 AI COMPANY EXTRACTION
-    ↓
-04 AI COMPANY RESEARCH / ENRICHMENT
-    ↓
-05 DETERMINISTIC VALIDATION
-    ↓
-06 DETERMINISTIC ICP SCORING
-    ↓
-RANKED JSON + CSV
-
-WHY HYBRID?
-
-The research problem is inherently messy.
-
-Different states and municipalities publish hauler information in different formats:
-
-- permit lists
-- franchise lists
-- regulatory databases
-- PDFs
-- municipal vendor pages
-- public reporting portals
-- government hubs linking to additional records
-
-Hard-coding every possible source would create a brittle ingestion layer.
-
-The agentic stages handle ambiguity:
-- finding relevant sources
-- interpreting source structure
-- extracting company evidence
-- researching missing company information
-
-The deterministic stages handle trust:
-- source routing
-- validation thresholds
-- ICP rules
-- record acceptance
-- scoring
-- ranking
-
-In short:
-
-The agent handles ambiguity. Python handles trust.
-
-PIPELINE STAGES
-
-01 — AI Source Discovery
-
-File:
 01_source_discovery_agent.py
+    ↓
+AI discovers authoritative public hauler sources
+    ↓
+02_validate_sources.py
+    ↓
+Source relevance + extractability routing
+    ↓
+03_company_extraction_agent.py
+    ↓
+Source-backed private hauler records
+    ↓
+04_company_research_agent.py
+    ↓
+Website + contact + service + scale research
+    ↓
+05_validate_companies.py
+    ↓
+Deterministic validation
+    ↓
+06_score_companies.py
+    ↓
+100-point ICP scoring
+    ↓
+Ranked JSON + CSV
+```
 
-Input example:
-Florida
+---
 
-The agent searches for authoritative public sources that may contain real private waste-service companies.
+## 1. Source Discovery
 
-Preferred sources include:
-- state regulatory agencies
-- county or municipal government
-- approved hauler lists
-- franchise holder lists
-- permit holder lists
-- public waste-management databases
-- government PDFs and reports
+`01_source_discovery_agent.py` accepts a U.S. state and uses agentic web research to locate authoritative public sources containing waste-hauler intelligence.
 
-Each source is classified by:
-- ICP relevance
-- source type
-- likelihood of containing real haulers
-- source confidence
-- extractability confidence
+The agent prioritizes sources such as:
 
-Example source types:
+- State regulatory agencies
+- Municipal and county governments
+- Licensed or permitted hauler lists
+- Franchise holder lists
+- Commercial recycling lists
+- Government databases
+- Public PDFs and reports
+
+Each source is classified by **ICP relevance** and **extractability**.
+
+```text
 DIRECT_LIST
 DATABASE
 HUB
 REQUIREMENTS_PAGE
 CONTRACT_RECORDS
 UNKNOWN
+```
 
-Output:
-data/discovered_sources.json
+A Florida test discovered authoritative sources including private roll-off franchise haulers, permitted hauler records, commercial recycling haulers, and government waste-management databases.
 
-02 — Deterministic Source Routing
+**Output:** `data/discovered_sources.json`
 
-File:
-02_validate_sources.py
+---
 
-Sources are routed using deterministic business rules.
+## 2. Source Routing
 
-Possible routes:
-EXTRACTABLE
-RESOLUTION
-REVIEW
-REJECTED
+`02_validate_sources.py` applies deterministic rules to decide what happens to each discovered source.
 
-A high-confidence government page that directly lists licensed haulers may be routed to EXTRACTABLE.
+```text
+Discovered source
+        ↓
+ICP relevance
+        ↓
+Extractability
+        ↓
+Confidence thresholds
+        ↓
+EXTRACTABLE / RESOLUTION / REVIEW / REJECTED
+```
 
-A government portal that only links to deeper datasets may be routed to RESOLUTION.
+| Route | Purpose |
+|---|---|
+| `EXTRACTABLE` | Contains usable company records |
+| `RESOLUTION` | Relevant hub requiring deeper source discovery |
+| `REVIEW` | Potentially useful but insufficiently clear |
+| `REJECTED` | Out of scope or unsuitable |
 
-This prevents the extraction agent from wasting time on sources that do not directly contain usable company records.
+This distinction matters because a source can be highly relevant to the ICP while still being unsuitable for direct company extraction.
 
-Outputs:
+In the Florida test, **3 sources were approved for direct extraction**, while a government database hub was correctly routed for resolution.
+
+**Outputs:**
+
+```text
 data/extractable_sources.json
 data/resolution_sources.json
 data/review_sources.json
 data/rejected_sources.json
+```
 
-03 — AI Company Extraction
+---
 
-File:
-03_company_extraction_agent.py
+## 3. Company Extraction
 
-The agent reads approved extractable sources and identifies real private waste-service companies.
+`03_company_extraction_agent.py` researches approved sources and extracts real private waste-service operators.
 
-Target company types include:
-- roll-off hauling
-- dumpster hauling
-- residential waste collection
-- commercial waste collection
-- recycling hauling
-- construction debris hauling
+Target services include:
 
-Adjacent services may include:
-- portable toilets
-- septic
-- liquid waste
-- restroom trailers
+- Roll-off hauling
+- Dumpster hauling
+- Commercial waste collection
+- Residential waste collection
+- Recycling hauling
+- Construction debris hauling
+- Portable toilets
+- Septic and liquid waste services
 
-The system excludes:
-- government sanitation departments
-- landfill-only operations
-- transfer-only operations
-- equipment manufacturers
-- brokers without hauling operations
-- hazardous-waste-only operators
+Every company must retain **source-backed evidence** connecting it to the authoritative source.
 
-Every company record must contain source-backed evidence.
+The engine excludes obvious non-ICP records such as government sanitation departments, landfill-only operations, equipment manufacturers, and brokers without hauling operations.
 
-Output:
-data/discovered_companies.json
+### Florida Test
 
-04 — AI Company Research
+```text
+3 extractable sources available
+        ↓
+2 sources processed in Demo Mode
+        ↓
+10 companies extracted
+        ↓
+0 duplicates
+        ↓
+10 source-backed company records
+```
 
-File:
-04_company_research_agent.py
+Example companies discovered included:
 
-The research agent enriches extracted companies using public web evidence.
+- Action Recycling
+- Anderson Rentals
+- Central Florida Dumpsters
+- Coastal Waste & Recycling
+- Comfort House
+- Atlantic Trash & Transfer
+- Express Waste of Miami
+- Everglades Waste Removal Services
+- Envirowaste Services Group
+- Trashco
 
-It attempts to verify or improve:
-- website
-- phone
-- location
-- service lines
+**Output:** `data/discovered_companies.json`
 
-It also looks for one defensible operational scale signal, such as:
-- counties served
-- cities served
-- geographic service area
-- branch locations
-- markets served
-- fleet size
-- employee count
-- municipal contracts
-- multi-state operations
+---
 
-Unknown values remain unknown.
+## 4. Company Research & Enrichment
 
-The system does not invent missing enrichment.
+`04_company_research_agent.py` performs public research on extracted companies.
 
-If the research stage fails because of an API or web-service issue, the original authoritative source-backed record is retained.
+The agent attempts to verify or improve:
 
-Output:
-data/enriched_companies.json
+```text
+Website
+Phone
+Location
+Service lines
+Operational scale signal
+```
 
-05 — Deterministic Validation
+Scale signals can include:
 
-File:
-05_validate_companies.py
+- Geographic service territory
+- Counties or cities served
+- Branch locations
+- Markets served
+- Fleet size
+- Employee count
+- Municipal contracts
+- Multi-state operations
 
-Company records are validated using fixed rules rather than LLM judgment.
+The system does **not fabricate missing enrichment**.
+
+If research fails or an external API is throttled, the original authoritative source-backed company record is retained.
+
+### Florida Test
+
+```text
+5 companies researched
+        ↓
+3 successfully enriched
+        ↓
+2 research calls unavailable
+        ↓
+2 original source-backed records retained
+        ↓
+5 records continue through pipeline
+```
+
+This prevents an optional enrichment failure from becoming a false rejection.
+
+**Output:** `data/enriched_companies.json`
+
+---
+
+## 5. Deterministic Validation
+
+`05_validate_companies.py` determines whether researched records are trustworthy enough to enter the scoring layer.
 
 Validation considers:
-- company identity
-- authoritative source evidence
-- discovery confidence
-- service fit
-- contactability
-- scale evidence
-- research confidence
+
+- Company identity
+- Authoritative source evidence
+- Discovery confidence
+- Service fit
+- Contactability
+- Scale evidence
+- Research confidence
 
 Possible outcomes:
+
+```text
 VALIDATED
 REVIEW
 REJECTED
+```
 
-Missing enrichment does not automatically mean poor fit.
+A key rule is:
 
-For example:
-No verified fleet size
+> **Missing data is unknown, not negative evidence.**
 
-is treated as:
-UNKNOWN
+For example, a company without a verified fleet-size signal is treated as:
+
+```text
+Scale: UNKNOWN
+```
 
 not:
-SMALL COMPANY
 
-This avoids turning missing data into false negative business signals.
+```text
+Company is small
+```
 
-Output:
-data/validated_companies.json
+This prevents incomplete public data from creating false-negative ICP decisions.
 
-06 — Deterministic ICP Scoring
+### Florida Test
 
-File:
-06_score_companies.py
+```text
+5 companies evaluated
+        ↓
+5 VALIDATED
+0 REVIEW
+0 REJECTED
+```
 
-Validated companies are scored against the ICP.
+**Output:** `data/validated_companies.json`
 
-The model currently uses four dimensions:
+---
 
-Service Fit: 40 points
-Operational Complexity: 20 points
-Scale Signal: 20 points
-Data Confidence: 20 points
-Total: 100 points
+## 6. ICP Scoring
 
-Service Fit
+`06_score_companies.py` applies a deterministic 100-point ICP model.
+
+| Scoring Dimension | Points |
+|---|---:|
+| Service Fit | 40 |
+| Operational Complexity | 20 |
+| Scale Signal | 20 |
+| Data Confidence | 20 |
+| **Total** | **100** |
+
+### Service Fit — 40 Points
+
 Measures alignment with core waste-hauling services.
 
-Operational Complexity
-Rewards companies with multiple relevant service lines.
+### Operational Complexity — 20 Points
 
-Scale Signal
-Rewards defensible evidence of operational scale.
+Rewards companies operating across multiple relevant service lines.
 
-Missing scale evidence receives no scale points, but does not reduce service-fit scoring.
+### Scale Signal — 20 Points
 
-Data Confidence
-Measures the strength of source evidence, discovery confidence, contact data, and successful research.
+Rewards defensible evidence of operational scale or geographic reach.
 
-Outputs:
+### Data Confidence — 20 Points
+
+Measures the strength of source evidence, discovery confidence, contactability, and successful research.
+
+Missing scale evidence receives **0 scale points**, but does not reduce the company's underlying service-fit score.
+
+**Outputs:**
+
+```text
 data/ranked_companies.json
 data/ranked_companies.csv
+```
 
-DEMO VS FULL MODE
+---
 
-The engine uses a centralized configuration file:
-config.py
+## Demo Mode vs. Full Mode
 
-Two operating modes are available.
+Runtime settings are centralized in `config.py`.
 
-DEMO MODE
+### Demo Mode
 
-Default:
-HAULER_MODE=demo
+Demo Mode is optimized for fast testing and live walkthroughs.
 
-Designed for fast iteration and live walkthroughs.
+```text
+Source target:          4
+Extraction sources:     2
+Companies per source:   5
+Companies researched:   5
+```
 
-Typical limits:
-4 source targets
-2 extraction sources
-5 companies per source
-5 companies researched
+Run:
 
-FULL MODE
-
-Run with:
-HAULER_MODE=full python run_demo.py
-
-Full mode expands the working limits for broader research.
-
-Typical configuration:
-12 source targets
-10 extraction sources
-25 companies per source
-100 companies researched
-
-These values are configurable and are not architectural limits.
-
-RUNNING THE ENGINE
-
-Install Dependencies:
-pip install -r requirements.txt
-
-Set the OpenAI API key:
-export OPENAI_API_KEY="your-key"
-
-In Google Colab, the key can be loaded securely using environment variables or getpass.
-
-Run the Entire Pipeline
-
-Demo mode:
+```bash
 python run_demo.py
+```
 
-Full mode:
+### Full Mode
+
+Full Mode expands the working limits for broader market research.
+
+```text
+Source target:          12
+Extraction sources:     10
+Companies per source:   25
+Companies researched:   100
+```
+
+Run:
+
+```bash
 HAULER_MODE=full python run_demo.py
+```
 
-The first stage asks:
+These are configurable operating limits, not architectural limits.
+
+---
+
+## Running the Engine
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Set an OpenAI API key:
+
+```bash
+export OPENAI_API_KEY="your-key"
+```
+
+Run the complete pipeline:
+
+```bash
+python run_demo.py
+```
+
+The engine will prompt:
+
+```text
 Enter a US state to research:
+```
 
-Example:
-Florida
+To restart from a specific stage:
 
-Start From a Specific Stage
-
-If earlier outputs already exist:
+```bash
 python run_demo.py --from-stage 03
+```
 
-Available stages:
-01
-02
-03
-04
-05
-06
+To display the latest results **without making any AI or web calls**:
 
-Show Existing Results Without API Calls
-
+```bash
 python run_demo.py --summary-only
+```
 
-This makes no AI or web-research calls.
+---
 
-It displays the latest pipeline state, including:
-Sources discovered
-Sources extractable
-Companies extracted
-Companies researched
-Companies enriched
-Companies validated
-Companies ranked
-Top ICP results
+## Failure Tolerance
 
-This is useful for demos when external API availability or rate limits are unpredictable.
-
-EXAMPLE RUN
-
-A Florida prototype run demonstrated the end-to-end workflow:
-
-State
-  ↓
-authoritative sources discovered
-  ↓
-extractable sources routed
-  ↓
-real companies extracted
-  ↓
-public research/enrichment
-  ↓
-deterministic validation
-  ↓
-deterministic ICP ranking
-
-The system successfully identified source-backed private operators, enriched available records, retained valid originals when enrichment was unavailable, and produced ranked JSON and CSV outputs.
-
-FAILURE TOLERANCE
-
-External research systems are not deterministic.
+Agentic web research depends on external services and is inherently less predictable than local deterministic code.
 
 The pipeline therefore includes:
-- bounded retries
-- request timeouts
-- checkpointing
-- preservation of successful prior outputs
-- graceful fallback to source-backed records
 
-If enrichment fails, the system does not discard a company simply because an optional research call failed.
+- Bounded retries
+- Request timeouts
+- Checkpointing
+- Preservation of completed outputs
+- Graceful fallback to authoritative source-backed records
 
-The authoritative record remains available for deterministic validation.
+```text
+Research succeeds
+        ↓
+Use enriched record
 
-GEOGRAPHIC SCALABILITY
+Research unavailable
+        ↓
+Retain source-backed record
+        ↓
+Continue deterministic validation
+```
 
-The original problem with a traditional scraper-based approach is that public waste data is geographically fragmented.
+A temporary research failure does not destroy valid upstream data.
 
-One state may publish licensed hauler PDFs, while another may expose county franchise lists, and another may only expose regulatory databases or municipal portals.
+---
 
-This prototype moves source acquisition into an agentic layer so the system can begin from STATE rather than PREPROGRAMMED URL.
+## Why Agentic?
 
-The downstream schema remains consistent even when the upstream source landscape changes.
+The original hauler ICP prototype used manually configured Texas public sources.
 
-The architecture is state-generic, but public-source availability and quality will vary by geography.
+That architecture works well once the sources are known, but geographic expansion creates a new problem:
 
-PRODUCTION EVOLUTION
+```text
+New state
+    ↓
+Find authoritative sources manually
+    ↓
+Inspect each source
+    ↓
+Determine whether it contains haulers
+    ↓
+Build or modify extraction logic
+    ↓
+Normalize records
+```
 
-This repository is a working prototype, not the final production architecture.
+This prototype moves the ambiguous portion upstream:
 
-A production version would likely add:
+```text
+State
+    ↓
+Agentic source discovery
+    ↓
+Source classification
+    ↓
+Agentic extraction / research
+    ↓
+Standardized records
+    ↓
+Deterministic validation
+    ↓
+Deterministic scoring
+```
 
-Source Resolution
-Automatically follow HUB sources and identify the underlying extractable dataset.
+The downstream business logic remains stable even when the upstream source landscape changes.
 
-Caching
-Avoid repeating expensive source discovery and company research unnecessarily.
+---
 
-Queue-Based Execution
-Move long-running research jobs into background workers.
+## Design Philosophy
 
-Provider-Aware Rate Limiting
-Manage concurrency and API throughput without manual intervention.
+This system intentionally does **not** make every step an AI agent.
 
-Source Freshness
-Track when public datasets were last checked and automatically refresh stale records.
+### AI is used for:
 
-Monitoring and Observability
+```text
+Source discovery
+Research
+Interpretation
+Heterogeneous extraction
+Ambiguous web investigation
+```
 
-Track:
-- agent success rate
-- extraction yield
-- enrichment success
-- source quality
-- validation rejection rates
-- token usage
-- research cost
-- latency
+### Deterministic Python is used for:
 
-Commercial Data Benchmarking
-
-Public data should not automatically be assumed to be the optimal production data source.
-
-At scale, I would benchmark:
-commercial enrichment
-vs.
-public-source research
-vs.
-hybrid acquisition
-
-against:
-cost per verified ICP account
-coverage
-accuracy
-refresh cost
-
-Human-in-the-Loop Review
-
-Low-confidence records could be routed for manual review rather than automatically accepted or rejected.
-
-Confidence-Based Model Escalation
-
-A production system could use lower-cost models for routine research and escalate only ambiguous records to stronger models.
-
-DESIGN PHILOSOPHY
-
-This prototype intentionally does not make every stage agentic.
-
-LLMs are useful for:
-research
-interpretation
-source discovery
-heterogeneous extraction
-ambiguous web investigation
-
-Traditional code is better for:
-business rules
-validation
-thresholds
-scoring
-ranking
-repeatability
-auditing
+```text
+Business rules
+Validation
+Thresholds
+Scoring
+Ranking
+Repeatability
+Auditing
+```
 
 The objective is not to maximize AI usage.
 
-The objective is to use the right execution model for each part of the system.
+The objective is to use AI where reasoning and flexibility create value while keeping consequential business rules reproducible and auditable.
 
-KEY FILES
+---
 
+## Production Evolution
+
+This is a **working prototype**, not a proposed production deployment as-is.
+
+A production implementation would likely add:
+
+- Automated resolution of `HUB` sources
+- Source and research caching
+- Source freshness monitoring
+- Queue-based execution
+- Provider-aware rate limiting
+- Cost and token observability
+- Human-in-the-loop review
+- Confidence-based model escalation
+- Larger-scale source-quality evaluation
+
+I would also benchmark public-source research against commercial enrichment providers before deciding what should be built versus bought.
+
+The relevant production metrics would include:
+
+```text
+Cost per verified ICP account
+Coverage
+Accuracy
+Refresh cost
+Research latency
+```
+
+---
+
+## Repository Structure
+
+```text
 config.py
 run_demo.py
 
@@ -504,24 +531,43 @@ run_demo.py
 06_score_companies.py
 
 data/
+├── discovered_sources.json
+├── extractable_sources.json
+├── resolution_sources.json
+├── review_sources.json
+├── rejected_sources.json
+├── discovered_companies.json
+├── enriched_companies.json
+├── validated_companies.json
+├── ranked_companies.json
+└── ranked_companies.csv
+```
 
-OUTPUT
+---
 
-Final ranked datasets:
+## Final Output
+
+The pipeline produces a ranked ICP dataset in both machine-readable and analyst-friendly formats:
+
+```text
 data/ranked_companies.json
 data/ranked_companies.csv
+```
 
-STATUS
+---
 
-Working prototype demonstrating:
-- geography-driven source discovery
-- agentic public-data research
-- source extractability classification
-- evidence-backed company extraction
-- resilient company enrichment
-- deterministic validation
-- deterministic ICP scoring
-- demo and full execution modes
-- checkpointed failure tolerance
+## Status
 
-The architecture is designed to demonstrate how an initially manual, geography-specific research process can evolve into a scalable market-intelligence system.
+The prototype currently demonstrates:
+
+- **Geography-driven source discovery**
+- **Agentic public-data research**
+- **Source extractability classification**
+- **Evidence-backed company extraction**
+- **Resilient company enrichment**
+- **Deterministic validation**
+- **Deterministic ICP scoring**
+- **Demo and Full execution modes**
+- **Checkpointed failure tolerance**
+
+The result is a working proof of how a manually configured, geography-specific hauler research process can evolve into a more scalable market intelligence system.
