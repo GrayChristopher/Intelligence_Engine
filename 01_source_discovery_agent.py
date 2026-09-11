@@ -1,10 +1,12 @@
 import asyncio
 import json
+import random
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 from agents import Agent, Runner, WebSearchTool
+from openai import RateLimitError
 
 
 # ---------------------------------------------------------
@@ -19,7 +21,27 @@ DATA_DIR.mkdir(exist_ok=True)
 
 
 # ---------------------------------------------------------
-# STRUCTURED OUTPUT SCHEMA
+# SETTINGS
+# ---------------------------------------------------------
+
+MODEL = "gpt-5.6-luna"
+
+MAX_RETRIES = 6
+
+# Automatic wait times after a 429.
+# Jitter is added so retries do not always hit at the same moment.
+BACKOFF_SECONDS = [
+    15,
+    30,
+    45,
+    60,
+    90,
+    120,
+]
+
+
+# ---------------------------------------------------------
+# STRUCTURED OUTPUT
 # ---------------------------------------------------------
 
 class HaulerSource(BaseModel):
@@ -33,7 +55,7 @@ class HaulerSource(BaseModel):
     icp_relevance: Literal[
         "CORE",
         "ADJACENT",
-        "OUT_OF_SCOPE"
+        "OUT_OF_SCOPE",
     ]
 
     extractability: Literal[
@@ -41,7 +63,7 @@ class HaulerSource(BaseModel):
         "DATABASE",
         "HUB",
         "REQUIREMENTS_PAGE",
-        "UNKNOWN"
+        "UNKNOWN",
     ]
 
     likely_contains_haulers: bool
@@ -49,10 +71,11 @@ class HaulerSource(BaseModel):
     confidence: float = Field(
         ge=0.0,
         le=1.0,
-        description=(
-            "Confidence that this is a real authoritative source "
-            "and that the source classification is correct."
-        )
+    )
+
+    extractability_confidence: float = Field(
+        ge=0.0,
+        le=1.0,
     )
 
     rationale: str
@@ -64,185 +87,202 @@ class SourceDiscoveryResult(BaseModel):
 
 
 # ---------------------------------------------------------
-# SOURCE DISCOVERY AGENT
+# AGENT
 # ---------------------------------------------------------
 
 source_agent = Agent(
     name="Waste Hauler Source Discovery Agent",
 
-    model="gpt-5.6-luna",
+    model=MODEL,
 
     instructions="""
-You are a source-discovery research agent supporting a waste-hauler
-intelligence system.
+You are a research agent building a structured database of authoritative
+waste-hauler data sources in the United States.
 
-The user will provide a US state.
+The user gives you one US state.
 
-Your job is to discover authoritative public sources that can identify
-waste-hauling companies in that state.
+Find approximately 8-15 HIGH-VALUE authoritative sources.
 
-You must evaluate TWO separate dimensions for every source:
+Quality matters more than quantity.
 
-1. ICP relevance
-2. Extractability
+Focus on state, county, and municipal sources that could identify actual
+private waste-hauling companies.
 
----------------------------------------------------------
+Do not waste research effort collecting many weak or redundant sources.
+
+
+=========================================================
 ICP RELEVANCE
----------------------------------------------------------
+=========================================================
 
 CORE
 
-Sources containing private operators involved in one or more of:
+Private operators involved in:
 
 - roll-off hauling
 - dumpster service
 - residential waste collection
 - commercial waste collection
-- front-load operations
-- rear-load operations
+- front-load collection
+- rear-load collection
 - recycling hauling
 - mixed solid-waste hauling
-- franchised municipal waste collection
-- licensed or permitted private solid-waste hauling
+- franchised municipal collection
+- licensed or permitted solid-waste hauling
+
 
 ADJACENT
 
-Sources containing operators involved in:
+Operators involved in:
 
-- portable toilet service
-- septic service
-- liquid waste hauling
+- portable toilets
+- septic
+- liquid waste
 - grease hauling
-- related field-service operations that may overlap with the ICP
+- related field-service businesses with meaningful overlap
+
 
 OUT_OF_SCOPE
 
-Sources primarily containing:
+Sources primarily covering:
 
-- hazardous-waste-only operators
-- waste-tire-only operators
+- hazardous-only operators
+- tire-only operators
 - landfill-only facilities
-- transfer-station-only facilities
+- transfer-only facilities
 - government sanitation departments
 - equipment manufacturers
-- waste brokers with no hauling operation
-- generic business directories with no authoritative permit/license basis
+- brokers with no hauling operation
+- generic commercial directories
 
 
----------------------------------------------------------
+=========================================================
 EXTRACTABILITY
----------------------------------------------------------
+=========================================================
 
 DIRECT_LIST
 
-Use when the source directly presents identifiable companies, such as:
+The source itself visibly lists identifiable private companies.
 
+Examples:
+
+- licensed hauler PDF
 - approved hauler list
-- licensed hauler list
-- permitted hauler list
 - franchise hauler list
-- government PDF containing company names
-- government webpage containing company names
-
-This is the strongest source type for downstream company extraction.
+- permitted transporter list
+- government webpage listing operators
 
 
 DATABASE
 
-Use when the source is a searchable or downloadable government database
-that contains identifiable operator/company records.
+An official searchable or downloadable database containing identifiable
+company/operator records.
 
 Examples:
 
-- permit database
+- permit registry
 - license database
-- registry
-- downloadable government dataset
+- government dataset
+- searchable operator database
 
 
 HUB
 
-Use when the source is mainly a landing page or report hub that points to
-other reports, databases, PDFs, or datasets, but does not itself directly
-contain the company records needed downstream.
+An authoritative landing page or report page that links to other datasets,
+reports, PDFs, or databases but does not itself contain the company records.
 
 Example:
 
-- "Waste Management Database Reports" page linking to multiple datasets
+A state "Waste Management Database Reports" page containing links to
+multiple underlying reports.
 
 
 REQUIREMENTS_PAGE
 
-Use when the source explains:
-
-- permit requirements
-- franchise requirements
-- licensing procedures
-- application processes
-
-but does not appear to contain an actual list of companies.
+An authoritative page explaining permit, licensing, franchise, or
+application requirements but not providing an actual operator list.
 
 
 UNKNOWN
 
-Use only when the source is authoritative but there is not enough evidence
-to confidently determine its extractability.
+Use only when there is insufficient evidence to confidently classify
+extractability.
 
 
----------------------------------------------------------
+=========================================================
 SOURCE PRIORITY
----------------------------------------------------------
+=========================================================
 
-Prioritize:
+Prefer:
 
-1. State government sources
-2. County government sources
-3. Municipal government sources
-4. Government PDFs
-5. Government permit/license databases
-6. Official franchise or approved-hauler lists
+1. State government databases
+2. County licensed-hauler lists
+3. County franchise lists
+4. Municipal approved-hauler lists
+5. Government PDFs containing operators
+6. Permit/license databases
+7. Official recycling-hauler lists
 
 
 Avoid:
 
-- SEO listicles
-- generic business directories
-- lead-generation databases
-- unsupported company lists
-- sources with unclear provenance
+- generic directories
+- Yelp
+- Yellow Pages
+- lead databases
+- SEO articles
+- unsupported commercial lists
 
 
----------------------------------------------------------
+=========================================================
+IMPORTANT DISTINCTION
+=========================================================
+
+ICP relevance and extractability are DIFFERENT.
+
+For example:
+
+A state waste-management report hub may be highly relevant to the ICP,
+but its extractability should be HUB rather than DIRECT_LIST.
+
+A county licensed-hauler PDF containing company names should usually be:
+
+ICP relevance = CORE
+Extractability = DIRECT_LIST
+
+
+=========================================================
 RULES
----------------------------------------------------------
+=========================================================
 
 For every source:
 
-- identify the jurisdiction
-- identify the government or regulatory authority
-- identify the source type
-- provide the source URL
+- verify that the source appears legitimate
+- identify jurisdiction
+- identify authority
+- return the real URL
 - classify ICP relevance
 - classify extractability
-- determine whether it likely contains actual hauler records
-- provide a confidence score
-- explain briefly why the source matters
+- determine whether actual hauler companies are likely present
+- assign overall confidence
+- assign extractability confidence
+- provide a short rationale
+
+Do not invent URLs.
 
 Do not invent sources.
 
-Do not suppress legitimate authoritative sources merely because they are
-out of scope. Return them and classify them correctly.
+Do not label a landing page DIRECT_LIST just because it links to a list.
 
-Do not classify a generic landing page as DIRECT_LIST merely because it
-links to company data elsewhere.
+Do not label a permit instructions page DIRECT_LIST unless actual operators
+are visibly listed.
 
-Do not classify a requirements page as DIRECT_LIST unless actual company
-records are visible on that source.
+Return weak or irrelevant authoritative sources only when useful for
+demonstrating classification.
 
-If evidence is ambiguous, use UNKNOWN or lower confidence rather than
-guessing.
+Prioritize a compact set of strong sources rather than exhaustive research.
 
-Return structured data matching the required output schema.
+Return structured output only.
 """,
 
     tools=[
@@ -254,62 +294,113 @@ Return structured data matching the required output schema.
 
 
 # ---------------------------------------------------------
-# RUN AGENT
+# RATE-LIMIT-AWARE RUNNER
 # ---------------------------------------------------------
 
-async def main():
+async def run_with_retry(state: str):
 
-    state = input(
-        "\nEnter a US state to research: "
-    ).strip()
-
-    if not state:
-        raise ValueError("A state is required.")
-
-    print(
-        f"\nResearching authoritative waste-hauler sources for {state}...\n"
-    )
-
-    result = await Runner.run(
-        source_agent,
-        f"""
-Find authoritative public waste-hauler data sources for:
+    prompt = f"""
+Research authoritative public sources for private waste-hauling companies.
 
 STATE: {state}
 
-Search broadly across state, county, and municipal government sources.
+Find approximately 8-15 strong sources across state, county, and municipal
+government.
 
-The goal is to discover strong source candidates and correctly distinguish:
+Prioritize sources that can ultimately identify actual private hauling
+companies.
 
-- ICP relevance
-- whether the source directly supports downstream company extraction
+Be especially careful to distinguish:
 
-Return legitimate sources even when they are ultimately classified
-ADJACENT, OUT_OF_SCOPE, HUB, REQUIREMENTS_PAGE, or UNKNOWN.
+DIRECT_LIST
+DATABASE
+HUB
+REQUIREMENTS_PAGE
+
+Do not perform exhaustive web research. Focus on the best authoritative
+sources you can verify.
 """
-    )
 
-    output = result.final_output
+    for attempt in range(MAX_RETRIES):
 
-    # -----------------------------------------------------
-    # SAVE STRUCTURED OUTPUT
-    # -----------------------------------------------------
+        try:
 
-    with open(
-        OUTPUT_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            output.model_dump(),
-            f,
-            indent=2,
-            ensure_ascii=False
-        )
+            print(
+                f"Agent attempt {attempt + 1}/{MAX_RETRIES}..."
+            )
 
-    # -----------------------------------------------------
-    # SUMMARY COUNTS
-    # -----------------------------------------------------
+            result = await Runner.run(
+                source_agent,
+                prompt,
+            )
+
+            return result.final_output
+
+        except RateLimitError:
+
+            if attempt == MAX_RETRIES - 1:
+                raise
+
+            base_wait = BACKOFF_SECONDS[
+                min(attempt, len(BACKOFF_SECONDS) - 1)
+            ]
+
+            jitter = random.randint(1, 8)
+
+            wait_time = base_wait + jitter
+
+            print()
+            print("OpenAI rate limit reached.")
+            print(
+                f"Automatically waiting {wait_time} seconds "
+                "before retrying..."
+            )
+            print()
+
+            await asyncio.sleep(wait_time)
+
+        except Exception as exc:
+
+            # Some SDK/API layers may wrap a 429 instead of exposing
+            # RateLimitError directly.
+            error_text = str(exc).lower()
+
+            if (
+                "429" in error_text
+                or "rate limit" in error_text
+                or "tokens per min" in error_text
+            ):
+
+                if attempt == MAX_RETRIES - 1:
+                    raise
+
+                base_wait = BACKOFF_SECONDS[
+                    min(attempt, len(BACKOFF_SECONDS) - 1)
+                ]
+
+                jitter = random.randint(1, 8)
+
+                wait_time = base_wait + jitter
+
+                print()
+                print("OpenAI rate limit detected.")
+                print(
+                    f"Automatically waiting {wait_time} seconds "
+                    "before retrying..."
+                )
+                print()
+
+                await asyncio.sleep(wait_time)
+
+            else:
+                raise
+
+
+# ---------------------------------------------------------
+# SUMMARY
+# ---------------------------------------------------------
+
+def print_summary(output: SourceDiscoveryResult):
 
     relevance_counts = {
         "CORE": 0,
@@ -329,57 +420,165 @@ ADJACENT, OUT_OF_SCOPE, HUB, REQUIREMENTS_PAGE, or UNKNOWN.
         relevance_counts[source.icp_relevance] += 1
         extractability_counts[source.extractability] += 1
 
-    # -----------------------------------------------------
-    # PRINT SUMMARY
-    # -----------------------------------------------------
-
-    print("\nSOURCE DISCOVERY COMPLETE")
-    print("=" * 70)
+    print()
+    print("=" * 72)
+    print("SOURCE DISCOVERY COMPLETE")
+    print("=" * 72)
 
     print(f"\nState: {output.state}")
-    print(f"Total sources found: {len(output.sources)}")
+    print(f"Total sources: {len(output.sources)}")
 
     print("\nICP RELEVANCE")
-    print("-" * 70)
+    print("-" * 72)
     print(f"CORE:         {relevance_counts['CORE']}")
     print(f"ADJACENT:     {relevance_counts['ADJACENT']}")
     print(f"OUT_OF_SCOPE: {relevance_counts['OUT_OF_SCOPE']}")
 
     print("\nEXTRACTABILITY")
-    print("-" * 70)
-    print(f"DIRECT_LIST:       {extractability_counts['DIRECT_LIST']}")
-    print(f"DATABASE:          {extractability_counts['DATABASE']}")
-    print(f"HUB:               {extractability_counts['HUB']}")
-    print(f"REQUIREMENTS_PAGE: {extractability_counts['REQUIREMENTS_PAGE']}")
-    print(f"UNKNOWN:           {extractability_counts['UNKNOWN']}")
-
+    print("-" * 72)
     print(
-        f"\nSaved structured output to:\n{OUTPUT_FILE}\n"
+        f"DIRECT_LIST:       "
+        f"{extractability_counts['DIRECT_LIST']}"
+    )
+    print(
+        f"DATABASE:          "
+        f"{extractability_counts['DATABASE']}"
+    )
+    print(
+        f"HUB:               "
+        f"{extractability_counts['HUB']}"
+    )
+    print(
+        f"REQUIREMENTS_PAGE: "
+        f"{extractability_counts['REQUIREMENTS_PAGE']}"
+    )
+    print(
+        f"UNKNOWN:           "
+        f"{extractability_counts['UNKNOWN']}"
     )
 
-    # -----------------------------------------------------
-    # PRINT SOURCES
-    # -----------------------------------------------------
+    print()
+    print("SOURCES")
+    print("=" * 72)
 
-    for i, source in enumerate(
-        output.sources,
-        start=1
-    ):
+    for i, source in enumerate(output.sources, start=1):
 
+        print()
         print(f"{i}. {source.source_name}")
-        print(f"   ICP relevance:  {source.icp_relevance}")
-        print(f"   Extractability: {source.extractability}")
-        print(f"   Jurisdiction:   {source.jurisdiction}")
-        print(f"   Authority:      {source.authority}")
-        print(f"   Type:           {source.source_type}")
-        print(f"   URL:            {source.source_url}")
+
+        print(
+            f"   ICP:            "
+            f"{source.icp_relevance}"
+        )
+
+        print(
+            f"   Extractability: "
+            f"{source.extractability}"
+        )
+
+        print(
+            f"   Jurisdiction:   "
+            f"{source.jurisdiction}"
+        )
+
+        print(
+            f"   Authority:      "
+            f"{source.authority}"
+        )
+
+        print(
+            f"   Source type:    "
+            f"{source.source_type}"
+        )
+
         print(
             f"   Contains haulers: "
             f"{source.likely_contains_haulers}"
         )
-        print(f"   Confidence:     {source.confidence:.2f}")
-        print(f"   Why:            {source.rationale}")
-        print()
+
+        print(
+            f"   Confidence:     "
+            f"{source.confidence:.2f}"
+        )
+
+        print(
+            f"   Extract conf:   "
+            f"{source.extractability_confidence:.2f}"
+        )
+
+        print(
+            f"   URL:            "
+            f"{source.source_url}"
+        )
+
+        print(
+            f"   Why:            "
+            f"{source.rationale}"
+        )
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+
+async def main():
+
+    print()
+    print("=" * 72)
+    print("HAULER INTELLIGENCE ENGINE")
+    print("SOURCE DISCOVERY")
+    print("=" * 72)
+
+    state = input(
+        "\nEnter a US state to research: "
+    ).strip()
+
+    if not state:
+        raise ValueError(
+            "A US state is required."
+        )
+
+    print()
+    print(
+        f"Researching authoritative hauler sources for {state}..."
+    )
+    print(
+        f"Model: {MODEL}"
+    )
+    print()
+
+    output = await run_with_retry(
+        state
+    )
+
+    # -----------------------------------------------------
+    # SAVE
+    # -----------------------------------------------------
+
+    with open(
+        OUTPUT_FILE,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            output.model_dump(),
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print_summary(
+        output
+    )
+
+    print()
+    print("=" * 72)
+    print(
+        f"Saved: {OUTPUT_FILE}"
+    )
+    print("=" * 72)
+    print()
 
 
 if __name__ == "__main__":
