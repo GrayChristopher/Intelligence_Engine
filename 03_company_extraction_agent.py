@@ -20,8 +20,8 @@ OUTPUT_FILE = DATA_DIR / "discovered_companies.json"
 
 MODEL = "gpt-5.6-luna"
 
-# Small prototype limits to avoid rate-limit issues
-MAX_SOURCES = 1
+TARGET_SOURCE_KEYWORD = "Orange County Licensed Commercial Hauler"
+
 MAX_COMPANIES_PER_SOURCE = 5
 MAX_TOTAL_COMPANIES = 5
 
@@ -74,7 +74,8 @@ government or regulatory sources.
 
 You will receive ONE previously validated source.
 
-Your task is to identify actual companies supported by that source.
+Your job is to identify actual private-sector waste-hauling companies
+supported by that source.
 
 TARGET COMPANY TYPES:
 
@@ -99,14 +100,15 @@ DO NOT RETURN:
 - brokers with no hauling operation
 - hazardous-only operators
 - waste-tire-only operators
-- obvious duplicates or parser artifacts
+- duplicates
+- parser artifacts
 
 RULES:
 
-1. Use the supplied authoritative source as the primary evidence.
+1. The supplied authoritative source must be the primary evidence.
 
-2. You may use web search to locate the actual list, PDF, permit page,
-   or supporting page.
+2. Use web search if necessary to locate the actual list, PDF, or
+   supporting government page.
 
 3. Do not invent companies.
 
@@ -114,14 +116,17 @@ RULES:
 
 5. If a field cannot be verified, return null or an empty list.
 
-6. Return no more than the requested maximum number of companies.
+6. Return no more than the requested number of companies.
 
 7. Prefer distinct private hauling companies.
 
-8. Confidence should reflect how strongly the authoritative source supports
-   the company's inclusion.
+8. Confidence should reflect how strongly the source supports inclusion.
 
-9. Keep evidence concise and specific.
+9. Evidence should identify why the company was included and reference
+   the authoritative source.
+
+10. If the authoritative source does not actually provide identifiable
+    company records, return an empty companies list.
 
 Return structured output only.
 """,
@@ -163,8 +168,38 @@ def company_dedupe_key(company: CompanyCandidate) -> str:
     )
 
 
+def select_target_source(accepted_sources: list[dict]) -> dict:
+    matches = [
+        source
+        for source in accepted_sources
+        if TARGET_SOURCE_KEYWORD.lower()
+        in source["source_name"].lower()
+    ]
+
+    if not matches:
+        available = "\n".join(
+            f"- {source['source_name']}"
+            for source in accepted_sources
+        )
+
+        raise ValueError(
+            f"No accepted source matched:\n"
+            f"{TARGET_SOURCE_KEYWORD}\n\n"
+            f"Available accepted sources:\n"
+            f"{available}"
+        )
+
+    # If more than one matches, prefer highest-confidence source.
+    matches.sort(
+        key=lambda source: source["confidence"],
+        reverse=True
+    )
+
+    return matches[0]
+
+
 # ---------------------------------------------------------
-# EXTRACT ONE SOURCE
+# EXTRACT SOURCE
 # ---------------------------------------------------------
 
 async def extract_source(source: dict) -> SourceExtractionResult:
@@ -173,11 +208,12 @@ async def extract_source(source: dict) -> SourceExtractionResult:
     print("-" * 70)
     print(f"Extracting: {source['source_name']}")
     print(f"URL: {source['source_url']}")
+    print(f"Confidence: {source['confidence']:.2f}")
     print("-" * 70)
 
     prompt = f"""
 Extract a maximum of {MAX_COMPANIES_PER_SOURCE} real waste-hauling companies
-from this validated source.
+from this validated authoritative source.
 
 SOURCE NAME:
 {source["source_name"]}
@@ -197,12 +233,16 @@ SOURCE TYPE:
 ICP RELEVANCE:
 {source["icp_relevance"]}
 
-SOURCE RATIONALE:
+SOURCE DISCOVERY RATIONALE:
 {source["rationale"]}
 
-The authoritative source must be the primary evidence for inclusion.
+The authoritative source above must be the primary evidence for company
+inclusion.
 
 Return at most {MAX_COMPANIES_PER_SOURCE} companies.
+
+If the source does not actually contain identifiable company records,
+return zero companies rather than guessing.
 """
 
     result = await Runner.run(
@@ -232,30 +272,49 @@ async def main():
             "accepted_sources.json contains no sources."
         )
 
-    test_sources = accepted_sources[:MAX_SOURCES]
+    target_source = select_target_source(
+        accepted_sources
+    )
 
     print("\nCOMPANY EXTRACTION TEST")
     print("=" * 70)
-    print(f"Accepted sources available: {len(accepted_sources)}")
-    print(f"Sources being tested:       {len(test_sources)}")
-    print(f"Max companies per source:   {MAX_COMPANIES_PER_SOURCE}")
-    print(f"Global company cap:         {MAX_TOTAL_COMPANIES}")
 
-    all_companies = []
+    print(
+        f"Accepted sources available: "
+        f"{len(accepted_sources)}"
+    )
 
-    for source in test_sources:
+    print(
+        f"Target source keyword:      "
+        f"{TARGET_SOURCE_KEYWORD}"
+    )
 
-        extraction = await extract_source(source)
+    print(
+        f"Selected source:            "
+        f"{target_source['source_name']}"
+    )
 
-        print(
-            f"\nAgent returned "
-            f"{len(extraction.companies)} companies."
-        )
+    print(
+        f"Max companies:              "
+        f"{MAX_TOTAL_COMPANIES}"
+    )
 
-        all_companies.extend(extraction.companies)
+    # -----------------------------------------------------
+    # AGENTIC EXTRACTION
+    # -----------------------------------------------------
 
-        if len(all_companies) >= MAX_TOTAL_COMPANIES:
-            break
+    extraction = await extract_source(
+        target_source
+    )
+
+    all_companies = extraction.companies[
+        :MAX_TOTAL_COMPANIES
+    ]
+
+    print(
+        f"\nAgent returned "
+        f"{len(all_companies)} companies."
+    )
 
     # -----------------------------------------------------
     # DETERMINISTIC DEDUPLICATION
@@ -276,17 +335,31 @@ async def main():
             if company.confidence > existing.confidence:
                 unique_companies[key] = company
 
-    final_companies = list(unique_companies.values())
-    final_companies = final_companies[:MAX_TOTAL_COMPANIES]
+    final_companies = list(
+        unique_companies.values()
+    )
+
+    final_companies = final_companies[
+        :MAX_TOTAL_COMPANIES
+    ]
 
     # -----------------------------------------------------
     # SAVE
     # -----------------------------------------------------
 
     output = {
-        "sources_processed": len(test_sources),
-        "companies_before_deduplication": len(all_companies),
-        "companies_after_deduplication": len(final_companies),
+        "target_source": {
+            "source_name": target_source["source_name"],
+            "source_url": target_source["source_url"],
+            "jurisdiction": target_source["jurisdiction"],
+            "confidence": target_source["confidence"],
+        },
+        "companies_before_deduplication": len(
+            all_companies
+        ),
+        "companies_after_deduplication": len(
+            final_companies
+        ),
         "companies": [
             company.model_dump()
             for company in final_companies
@@ -313,8 +386,8 @@ async def main():
     print("=" * 70)
 
     print(
-        f"Sources processed:              "
-        f"{output['sources_processed']}"
+        f"Source processed: "
+        f"{target_source['source_name']}"
     )
 
     print(
@@ -340,35 +413,45 @@ async def main():
         start=1
     ):
 
-        print(f"{i}. {company.company_name}")
+        print(
+            f"{i}. {company.company_name}"
+        )
+
         print(
             f"   Location: "
             f"{company.location or 'UNKNOWN'}"
         )
+
         print(
             f"   Website: "
             f"{company.website or 'UNKNOWN'}"
         )
+
         print(
             f"   Phone: "
             f"{company.phone or 'UNKNOWN'}"
         )
+
         print(
             f"   Services: "
             f"{', '.join(company.service_lines) if company.service_lines else 'UNKNOWN'}"
         )
+
         print(
             f"   Confidence: "
             f"{company.confidence:.2f}"
         )
+
         print(
             f"   Source: "
             f"{company.source_name}"
         )
+
         print(
             f"   Evidence: "
             f"{company.evidence}"
         )
+
         print()
 
 
