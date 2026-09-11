@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 from pathlib import Path
 from typing import Literal
 
@@ -9,9 +8,9 @@ from agents import Agent, Runner, WebSearchTool
 from openai import RateLimitError
 
 
-# ---------------------------------------------------------
-# PATHS
-# ---------------------------------------------------------
+# =========================================================
+# CONFIG
+# =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -19,36 +18,25 @@ OUTPUT_FILE = DATA_DIR / "discovered_sources.json"
 
 DATA_DIR.mkdir(exist_ok=True)
 
-
-# ---------------------------------------------------------
-# SETTINGS
-# ---------------------------------------------------------
-
 MODEL = "gpt-5.6-luna"
 
-MAX_RETRIES = 6
-
-# Automatic wait times after a 429.
-# Jitter is added so retries do not always hit at the same moment.
-BACKOFF_SECONDS = [
-    15,
-    30,
-    45,
-    60,
-    90,
-    120,
-]
+MAX_ATTEMPTS = 2
+ATTEMPT_TIMEOUT_SECONDS = 90
+RETRY_WAIT_SECONDS = 10
 
 
-# ---------------------------------------------------------
+# =========================================================
 # STRUCTURED OUTPUT
-# ---------------------------------------------------------
+# =========================================================
 
 class HaulerSource(BaseModel):
+
     jurisdiction: str
     state: str
+
     source_name: str
     source_url: str
+
     source_type: str
     authority: str
 
@@ -82,33 +70,49 @@ class HaulerSource(BaseModel):
 
 
 class SourceDiscoveryResult(BaseModel):
+
     state: str
     sources: list[HaulerSource]
 
 
-# ---------------------------------------------------------
+# =========================================================
 # AGENT
-# ---------------------------------------------------------
+# =========================================================
 
 source_agent = Agent(
-    name="Waste Hauler Source Discovery Agent",
+
+    name="Hauler Source Discovery Agent",
 
     model=MODEL,
 
     instructions="""
-You are a research agent building a structured database of authoritative
-waste-hauler data sources in the United States.
+You are the source-discovery layer of a waste-hauler intelligence system.
 
-The user gives you one US state.
+The user provides one US state.
 
-Find approximately 8-15 HIGH-VALUE authoritative sources.
+Your job is NOT to perform exhaustive research.
 
-Quality matters more than quantity.
+Find EXACTLY FOUR high-value authoritative public sources that could help
+identify private waste-hauling companies in that state.
 
-Focus on state, county, and municipal sources that could identify actual
-private waste-hauling companies.
+The purpose is to quickly identify the strongest source types for a
+downstream company-extraction pipeline.
 
-Do not waste research effort collecting many weak or redundant sources.
+
+=========================================================
+SOURCE PRIORITY
+=========================================================
+
+Strongly prefer:
+
+1. Government licensed-hauler lists
+2. Government approved-hauler lists
+3. Government franchise-hauler lists
+4. Government permit/license databases
+5. Government PDFs directly listing operators
+6. State, county, or municipal operator databases
+
+Quality matters much more than geographic completeness.
 
 
 =========================================================
@@ -117,34 +121,34 @@ ICP RELEVANCE
 
 CORE
 
-Private operators involved in:
+Private companies involved in:
 
 - roll-off hauling
 - dumpster service
-- residential waste collection
 - commercial waste collection
+- residential waste collection
 - front-load collection
 - rear-load collection
 - recycling hauling
 - mixed solid-waste hauling
 - franchised municipal collection
-- licensed or permitted solid-waste hauling
+- licensed/permitted solid-waste hauling
 
 
 ADJACENT
 
-Operators involved in:
+Private operators involved in:
 
 - portable toilets
 - septic
 - liquid waste
 - grease hauling
-- related field-service businesses with meaningful overlap
+- closely related field-service operations
 
 
 OUT_OF_SCOPE
 
-Sources primarily covering:
+Primarily:
 
 - hazardous-only operators
 - tire-only operators
@@ -152,8 +156,8 @@ Sources primarily covering:
 - transfer-only facilities
 - government sanitation departments
 - equipment manufacturers
-- brokers with no hauling operation
-- generic commercial directories
+- brokers without hauling operations
+- generic business directories
 
 
 =========================================================
@@ -162,14 +166,14 @@ EXTRACTABILITY
 
 DIRECT_LIST
 
-The source itself visibly lists identifiable private companies.
+The source directly contains identifiable private companies.
 
 Examples:
 
-- licensed hauler PDF
+- licensed hauler list
 - approved hauler list
-- franchise hauler list
-- permitted transporter list
+- franchise list
+- government PDF listing operators
 - government webpage listing operators
 
 
@@ -180,74 +184,50 @@ company/operator records.
 
 Examples:
 
-- permit registry
-- license database
-- government dataset
-- searchable operator database
+- permit database
+- license registry
+- government operator database
 
 
 HUB
 
-An authoritative landing page or report page that links to other datasets,
-reports, PDFs, or databases but does not itself contain the company records.
-
-Example:
-
-A state "Waste Management Database Reports" page containing links to
-multiple underlying reports.
+A government landing/report page that points to other reports, datasets,
+PDFs, or databases but does NOT itself provide the actual company list.
 
 
 REQUIREMENTS_PAGE
 
-An authoritative page explaining permit, licensing, franchise, or
-application requirements but not providing an actual operator list.
+A government page describing:
+
+- permit requirements
+- licensing rules
+- franchise rules
+- application procedures
+
+but not actually listing operators.
 
 
 UNKNOWN
 
-Use only when there is insufficient evidence to confidently classify
-extractability.
+Use only when there is not enough evidence to classify the source.
 
 
 =========================================================
-SOURCE PRIORITY
+IMPORTANT
 =========================================================
 
-Prefer:
+ICP relevance and extractability are separate.
 
-1. State government databases
-2. County licensed-hauler lists
-3. County franchise lists
-4. Municipal approved-hauler lists
-5. Government PDFs containing operators
-6. Permit/license databases
-7. Official recycling-hauler lists
+Example:
 
+A state waste-management database landing page can be:
 
-Avoid:
+ICP = CORE
+Extractability = HUB
 
-- generic directories
-- Yelp
-- Yellow Pages
-- lead databases
-- SEO articles
-- unsupported commercial lists
+A county licensed commercial hauler PDF can be:
 
-
-=========================================================
-IMPORTANT DISTINCTION
-=========================================================
-
-ICP relevance and extractability are DIFFERENT.
-
-For example:
-
-A state waste-management report hub may be highly relevant to the ICP,
-but its extractability should be HUB rather than DIRECT_LIST.
-
-A county licensed-hauler PDF containing company names should usually be:
-
-ICP relevance = CORE
+ICP = CORE
 Extractability = DIRECT_LIST
 
 
@@ -255,32 +235,28 @@ Extractability = DIRECT_LIST
 RULES
 =========================================================
 
-For every source:
+Return EXACTLY FOUR sources.
 
-- verify that the source appears legitimate
-- identify jurisdiction
-- identify authority
-- return the real URL
-- classify ICP relevance
-- classify extractability
-- determine whether actual hauler companies are likely present
-- assign overall confidence
-- assign extractability confidence
-- provide a short rationale
+Prioritize sources that are useful for downstream company extraction.
 
-Do not invent URLs.
+Prefer DIRECT_LIST and DATABASE sources.
+
+At least TWO of the four sources should ideally be DIRECT_LIST or DATABASE.
+
+Do not perform exhaustive statewide research.
+
+Do not spend time collecting redundant sources.
 
 Do not invent sources.
 
-Do not label a landing page DIRECT_LIST just because it links to a list.
+Do not invent URLs.
 
-Do not label a permit instructions page DIRECT_LIST unless actual operators
-are visibly listed.
+Do not use Yelp, Yellow Pages, commercial directories, SEO pages,
+or lead databases.
 
-Return weak or irrelevant authoritative sources only when useful for
-demonstrating classification.
+If a source is uncertain, lower the confidence rather than inventing facts.
 
-Prioritize a compact set of strong sources rather than exhaustive research.
+Keep rationale short.
 
 Return structured output only.
 """,
@@ -293,267 +269,134 @@ Return structured output only.
 )
 
 
-# ---------------------------------------------------------
-# RATE-LIMIT-AWARE RUNNER
-# ---------------------------------------------------------
+# =========================================================
+# RUN AGENT
+# =========================================================
 
-async def run_with_retry(state: str):
+async def discover_sources(state: str):
 
     prompt = f"""
-Research authoritative public sources for private waste-hauling companies.
-
 STATE: {state}
 
-Find approximately 8-15 strong sources across state, county, and municipal
-government.
+Find exactly FOUR strong authoritative public sources for private
+waste-hauling company discovery.
 
-Prioritize sources that can ultimately identify actual private hauling
-companies.
+This is a FAST discovery pass.
 
-Be especially careful to distinguish:
+Prioritize sources that can directly feed company extraction:
 
-DIRECT_LIST
-DATABASE
-HUB
-REQUIREMENTS_PAGE
+- licensed hauler lists
+- approved hauler lists
+- franchise lists
+- permit databases
+- government PDFs containing operator names
 
-Do not perform exhaustive web research. Focus on the best authoritative
-sources you can verify.
+Avoid exhaustive research.
+
+Return exactly four sources.
 """
 
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+
+        print()
+        print(
+            f"Discovery attempt {attempt}/{MAX_ATTEMPTS}..."
+        )
 
         try:
 
-            print(
-                f"Agent attempt {attempt + 1}/{MAX_RETRIES}..."
-            )
+            result = await asyncio.wait_for(
 
-            result = await Runner.run(
-                source_agent,
-                prompt,
+                Runner.run(
+                    source_agent,
+                    prompt,
+                ),
+
+                timeout=ATTEMPT_TIMEOUT_SECONDS,
             )
 
             return result.final_output
 
+        except asyncio.TimeoutError:
+
+            print()
+            print(
+                f"Attempt exceeded "
+                f"{ATTEMPT_TIMEOUT_SECONDS} seconds."
+            )
+
+            if attempt == MAX_ATTEMPTS:
+                raise RuntimeError(
+                    "Source discovery timed out."
+                )
+
+            print(
+                f"Retrying in {RETRY_WAIT_SECONDS} seconds..."
+            )
+
+            await asyncio.sleep(
+                RETRY_WAIT_SECONDS
+            )
+
         except RateLimitError:
 
-            if attempt == MAX_RETRIES - 1:
-                raise
-
-            base_wait = BACKOFF_SECONDS[
-                min(attempt, len(BACKOFF_SECONDS) - 1)
-            ]
-
-            jitter = random.randint(1, 8)
-
-            wait_time = base_wait + jitter
-
             print()
-            print("OpenAI rate limit reached.")
             print(
-                f"Automatically waiting {wait_time} seconds "
-                "before retrying..."
+                "OpenAI rate limit reached."
             )
-            print()
 
-            await asyncio.sleep(wait_time)
+            if attempt == MAX_ATTEMPTS:
+                raise RuntimeError(
+                    "Source discovery was blocked by the API rate limit."
+                )
+
+            print(
+                f"Retrying in {RETRY_WAIT_SECONDS} seconds..."
+            )
+
+            await asyncio.sleep(
+                RETRY_WAIT_SECONDS
+            )
 
         except Exception as exc:
 
-            # Some SDK/API layers may wrap a 429 instead of exposing
-            # RateLimitError directly.
-            error_text = str(exc).lower()
+            text = str(exc).lower()
 
             if (
-                "429" in error_text
-                or "rate limit" in error_text
-                or "tokens per min" in error_text
+                "429" in text
+                or "rate limit" in text
+                or "tokens per min" in text
             ):
 
-                if attempt == MAX_RETRIES - 1:
-                    raise
-
-                base_wait = BACKOFF_SECONDS[
-                    min(attempt, len(BACKOFF_SECONDS) - 1)
-                ]
-
-                jitter = random.randint(1, 8)
-
-                wait_time = base_wait + jitter
-
                 print()
-                print("OpenAI rate limit detected.")
                 print(
-                    f"Automatically waiting {wait_time} seconds "
-                    "before retrying..."
+                    "OpenAI rate limit detected."
                 )
-                print()
 
-                await asyncio.sleep(wait_time)
+                if attempt == MAX_ATTEMPTS:
+                    raise RuntimeError(
+                        "Source discovery was blocked by the API rate limit."
+                    )
+
+                print(
+                    f"Retrying in {RETRY_WAIT_SECONDS} seconds..."
+                )
+
+                await asyncio.sleep(
+                    RETRY_WAIT_SECONDS
+                )
 
             else:
                 raise
 
 
-# ---------------------------------------------------------
-# SUMMARY
-# ---------------------------------------------------------
+# =========================================================
+# SAVE
+# =========================================================
 
-def print_summary(output: SourceDiscoveryResult):
-
-    relevance_counts = {
-        "CORE": 0,
-        "ADJACENT": 0,
-        "OUT_OF_SCOPE": 0,
-    }
-
-    extractability_counts = {
-        "DIRECT_LIST": 0,
-        "DATABASE": 0,
-        "HUB": 0,
-        "REQUIREMENTS_PAGE": 0,
-        "UNKNOWN": 0,
-    }
-
-    for source in output.sources:
-        relevance_counts[source.icp_relevance] += 1
-        extractability_counts[source.extractability] += 1
-
-    print()
-    print("=" * 72)
-    print("SOURCE DISCOVERY COMPLETE")
-    print("=" * 72)
-
-    print(f"\nState: {output.state}")
-    print(f"Total sources: {len(output.sources)}")
-
-    print("\nICP RELEVANCE")
-    print("-" * 72)
-    print(f"CORE:         {relevance_counts['CORE']}")
-    print(f"ADJACENT:     {relevance_counts['ADJACENT']}")
-    print(f"OUT_OF_SCOPE: {relevance_counts['OUT_OF_SCOPE']}")
-
-    print("\nEXTRACTABILITY")
-    print("-" * 72)
-    print(
-        f"DIRECT_LIST:       "
-        f"{extractability_counts['DIRECT_LIST']}"
-    )
-    print(
-        f"DATABASE:          "
-        f"{extractability_counts['DATABASE']}"
-    )
-    print(
-        f"HUB:               "
-        f"{extractability_counts['HUB']}"
-    )
-    print(
-        f"REQUIREMENTS_PAGE: "
-        f"{extractability_counts['REQUIREMENTS_PAGE']}"
-    )
-    print(
-        f"UNKNOWN:           "
-        f"{extractability_counts['UNKNOWN']}"
-    )
-
-    print()
-    print("SOURCES")
-    print("=" * 72)
-
-    for i, source in enumerate(output.sources, start=1):
-
-        print()
-        print(f"{i}. {source.source_name}")
-
-        print(
-            f"   ICP:            "
-            f"{source.icp_relevance}"
-        )
-
-        print(
-            f"   Extractability: "
-            f"{source.extractability}"
-        )
-
-        print(
-            f"   Jurisdiction:   "
-            f"{source.jurisdiction}"
-        )
-
-        print(
-            f"   Authority:      "
-            f"{source.authority}"
-        )
-
-        print(
-            f"   Source type:    "
-            f"{source.source_type}"
-        )
-
-        print(
-            f"   Contains haulers: "
-            f"{source.likely_contains_haulers}"
-        )
-
-        print(
-            f"   Confidence:     "
-            f"{source.confidence:.2f}"
-        )
-
-        print(
-            f"   Extract conf:   "
-            f"{source.extractability_confidence:.2f}"
-        )
-
-        print(
-            f"   URL:            "
-            f"{source.source_url}"
-        )
-
-        print(
-            f"   Why:            "
-            f"{source.rationale}"
-        )
-
-
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
-
-async def main():
-
-    print()
-    print("=" * 72)
-    print("HAULER INTELLIGENCE ENGINE")
-    print("SOURCE DISCOVERY")
-    print("=" * 72)
-
-    state = input(
-        "\nEnter a US state to research: "
-    ).strip()
-
-    if not state:
-        raise ValueError(
-            "A US state is required."
-        )
-
-    print()
-    print(
-        f"Researching authoritative hauler sources for {state}..."
-    )
-    print(
-        f"Model: {MODEL}"
-    )
-    print()
-
-    output = await run_with_retry(
-        state
-    )
-
-    # -----------------------------------------------------
-    # SAVE
-    # -----------------------------------------------------
+def save_output(
+    output: SourceDiscoveryResult
+):
 
     with open(
         OUTPUT_FILE,
@@ -568,18 +411,147 @@ async def main():
             ensure_ascii=False,
         )
 
-    print_summary(
+
+# =========================================================
+# DISPLAY
+# =========================================================
+
+def print_results(
+    output: SourceDiscoveryResult
+):
+
+    print()
+    print("=" * 72)
+    print("SOURCE DISCOVERY COMPLETE")
+    print("=" * 72)
+
+    print()
+    print(
+        f"State: {output.state}"
+    )
+
+    print(
+        f"Sources discovered: "
+        f"{len(output.sources)}"
+    )
+
+    print()
+
+    for number, source in enumerate(
+        output.sources,
+        start=1,
+    ):
+
+        print("-" * 72)
+
+        print(
+            f"{number}. "
+            f"{source.source_name}"
+        )
+
+        print(
+            f"Jurisdiction:   "
+            f"{source.jurisdiction}"
+        )
+
+        print(
+            f"Authority:      "
+            f"{source.authority}"
+        )
+
+        print(
+            f"ICP:            "
+            f"{source.icp_relevance}"
+        )
+
+        print(
+            f"Extractability: "
+            f"{source.extractability}"
+        )
+
+        print(
+            f"Contains haulers: "
+            f"{source.likely_contains_haulers}"
+        )
+
+        print(
+            f"Confidence:     "
+            f"{source.confidence:.2f}"
+        )
+
+        print(
+            f"Extract conf:   "
+            f"{source.extractability_confidence:.2f}"
+        )
+
+        print(
+            f"URL:            "
+            f"{source.source_url}"
+        )
+
+        print(
+            f"Why:            "
+            f"{source.rationale}"
+        )
+
+        print()
+
+    print("-" * 72)
+
+    print()
+    print(
+        f"Saved to: {OUTPUT_FILE}"
+    )
+
+    print()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+async def main():
+
+    print()
+    print("=" * 72)
+    print("HAULER INTELLIGENCE ENGINE")
+    print("FAST SOURCE DISCOVERY")
+    print("=" * 72)
+
+    state = input(
+        "\nEnter a US state to research: "
+    ).strip()
+
+    if not state:
+
+        raise ValueError(
+            "A US state is required."
+        )
+
+    print()
+    print(
+        f"Finding high-value hauler sources "
+        f"for {state}..."
+    )
+
+    print(
+        f"Model: {MODEL}"
+    )
+
+    output = await discover_sources(
+        state
+    )
+
+    save_output(
         output
     )
 
-    print()
-    print("=" * 72)
-    print(
-        f"Saved: {OUTPUT_FILE}"
+    print_results(
+        output
     )
-    print("=" * 72)
-    print()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(
+        main()
+    )
