@@ -36,12 +36,23 @@ class HaulerSource(BaseModel):
         "OUT_OF_SCOPE"
     ]
 
+    extractability: Literal[
+        "DIRECT_LIST",
+        "DATABASE",
+        "HUB",
+        "REQUIREMENTS_PAGE",
+        "UNKNOWN"
+    ]
+
     likely_contains_haulers: bool
 
     confidence: float = Field(
         ge=0.0,
         le=1.0,
-        description="Confidence that this is a real, authoritative source relevant to hauler discovery."
+        description=(
+            "Confidence that this is a real authoritative source "
+            "and that the source classification is correct."
+        )
     )
 
     rationale: str
@@ -62,32 +73,37 @@ source_agent = Agent(
     model="gpt-5.6-luna",
 
     instructions="""
-You are a source-discovery research agent supporting an ICP intelligence
-system for a waste-hauler software company.
+You are a source-discovery research agent supporting a waste-hauler
+intelligence system.
 
-Your job is to discover authoritative public sources that identify
-waste-hauling companies in a requested US state.
+The user will provide a US state.
 
-SEARCH BROADLY, BUT CLASSIFY EACH SOURCE BY ICP RELEVANCE.
+Your job is to discover authoritative public sources that can identify
+waste-hauling companies in that state.
+
+You must evaluate TWO separate dimensions for every source:
+
+1. ICP relevance
+2. Extractability
 
 ---------------------------------------------------------
-ICP DEFINITIONS
+ICP RELEVANCE
 ---------------------------------------------------------
 
 CORE
 
-Sources containing operators involved in one or more of:
+Sources containing private operators involved in one or more of:
 
 - roll-off hauling
+- dumpster service
 - residential waste collection
 - commercial waste collection
 - front-load operations
 - rear-load operations
-- dumpster service
 - recycling hauling
-- mixed waste-hauling operations
+- mixed solid-waste hauling
 - franchised municipal waste collection
-- licensed or permitted solid-waste hauling
+- licensed or permitted private solid-waste hauling
 
 ADJACENT
 
@@ -95,12 +111,13 @@ Sources containing operators involved in:
 
 - portable toilet service
 - septic service
-- related liquid-waste operations
-- adjacent field-service operators that may overlap with the target market
+- liquid waste hauling
+- grease hauling
+- related field-service operations that may overlap with the ICP
 
 OUT_OF_SCOPE
 
-Sources that are primarily:
+Sources primarily containing:
 
 - hazardous-waste-only operators
 - waste-tire-only operators
@@ -109,7 +126,68 @@ Sources that are primarily:
 - government sanitation departments
 - equipment manufacturers
 - waste brokers with no hauling operation
-- generic directories with no authoritative licensing or permit basis
+- generic business directories with no authoritative permit/license basis
+
+
+---------------------------------------------------------
+EXTRACTABILITY
+---------------------------------------------------------
+
+DIRECT_LIST
+
+Use when the source directly presents identifiable companies, such as:
+
+- approved hauler list
+- licensed hauler list
+- permitted hauler list
+- franchise hauler list
+- government PDF containing company names
+- government webpage containing company names
+
+This is the strongest source type for downstream company extraction.
+
+
+DATABASE
+
+Use when the source is a searchable or downloadable government database
+that contains identifiable operator/company records.
+
+Examples:
+
+- permit database
+- license database
+- registry
+- downloadable government dataset
+
+
+HUB
+
+Use when the source is mainly a landing page or report hub that points to
+other reports, databases, PDFs, or datasets, but does not itself directly
+contain the company records needed downstream.
+
+Example:
+
+- "Waste Management Database Reports" page linking to multiple datasets
+
+
+REQUIREMENTS_PAGE
+
+Use when the source explains:
+
+- permit requirements
+- franchise requirements
+- licensing procedures
+- application processes
+
+but does not appear to contain an actual list of companies.
+
+
+UNKNOWN
+
+Use only when the source is authoritative but there is not enough evidence
+to confidently determine its extractability.
+
 
 ---------------------------------------------------------
 SOURCE PRIORITY
@@ -124,6 +202,7 @@ Prioritize:
 5. Government permit/license databases
 6. Official franchise or approved-hauler lists
 
+
 Avoid:
 
 - SEO listicles
@@ -131,6 +210,7 @@ Avoid:
 - lead-generation databases
 - unsupported company lists
 - sources with unclear provenance
+
 
 ---------------------------------------------------------
 RULES
@@ -142,17 +222,25 @@ For every source:
 - identify the government or regulatory authority
 - identify the source type
 - provide the source URL
-- classify ICP relevance as CORE, ADJACENT, or OUT_OF_SCOPE
+- classify ICP relevance
+- classify extractability
 - determine whether it likely contains actual hauler records
 - provide a confidence score
-- explain briefly why it matters
+- explain briefly why the source matters
 
 Do not invent sources.
 
-Do not suppress out-of-scope discoveries if they are legitimate authoritative
-sources. Return them and classify them correctly.
+Do not suppress legitimate authoritative sources merely because they are
+out of scope. Return them and classify them correctly.
 
-If the evidence is ambiguous, lower confidence rather than guessing.
+Do not classify a generic landing page as DIRECT_LIST merely because it
+links to company data elsewhere.
+
+Do not classify a requirements page as DIRECT_LIST unless actual company
+records are visible on that source.
+
+If evidence is ambiguous, use UNKNOWN or lower confidence rather than
+guessing.
 
 Return structured data matching the required output schema.
 """,
@@ -191,11 +279,13 @@ STATE: {state}
 
 Search broadly across state, county, and municipal government sources.
 
-Return strong sources even if some are ultimately classified
-OUT_OF_SCOPE.
+The goal is to discover strong source candidates and correctly distinguish:
 
-The objective is broad source discovery followed by accurate
-ICP classification.
+- ICP relevance
+- whether the source directly supports downstream company extraction
+
+Return legitimate sources even when they are ultimately classified
+ADJACENT, OUT_OF_SCOPE, HUB, REQUIREMENTS_PAGE, or UNKNOWN.
 """
     )
 
@@ -205,7 +295,11 @@ ICP classification.
     # SAVE STRUCTURED OUTPUT
     # -----------------------------------------------------
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    with open(
+        OUTPUT_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
         json.dump(
             output.model_dump(),
             f,
@@ -214,36 +308,58 @@ ICP classification.
         )
 
     # -----------------------------------------------------
-    # SUMMARY
+    # SUMMARY COUNTS
     # -----------------------------------------------------
 
-    core = [
-        s for s in output.sources
-        if s.icp_relevance == "CORE"
-    ]
+    relevance_counts = {
+        "CORE": 0,
+        "ADJACENT": 0,
+        "OUT_OF_SCOPE": 0,
+    }
 
-    adjacent = [
-        s for s in output.sources
-        if s.icp_relevance == "ADJACENT"
-    ]
+    extractability_counts = {
+        "DIRECT_LIST": 0,
+        "DATABASE": 0,
+        "HUB": 0,
+        "REQUIREMENTS_PAGE": 0,
+        "UNKNOWN": 0,
+    }
 
-    out_of_scope = [
-        s for s in output.sources
-        if s.icp_relevance == "OUT_OF_SCOPE"
-    ]
+    for source in output.sources:
+        relevance_counts[source.icp_relevance] += 1
+        extractability_counts[source.extractability] += 1
+
+    # -----------------------------------------------------
+    # PRINT SUMMARY
+    # -----------------------------------------------------
 
     print("\nSOURCE DISCOVERY COMPLETE")
-    print("=" * 60)
+    print("=" * 70)
 
     print(f"\nState: {output.state}")
     print(f"Total sources found: {len(output.sources)}")
-    print(f"CORE: {len(core)}")
-    print(f"ADJACENT: {len(adjacent)}")
-    print(f"OUT_OF_SCOPE: {len(out_of_scope)}")
+
+    print("\nICP RELEVANCE")
+    print("-" * 70)
+    print(f"CORE:         {relevance_counts['CORE']}")
+    print(f"ADJACENT:     {relevance_counts['ADJACENT']}")
+    print(f"OUT_OF_SCOPE: {relevance_counts['OUT_OF_SCOPE']}")
+
+    print("\nEXTRACTABILITY")
+    print("-" * 70)
+    print(f"DIRECT_LIST:       {extractability_counts['DIRECT_LIST']}")
+    print(f"DATABASE:          {extractability_counts['DATABASE']}")
+    print(f"HUB:               {extractability_counts['HUB']}")
+    print(f"REQUIREMENTS_PAGE: {extractability_counts['REQUIREMENTS_PAGE']}")
+    print(f"UNKNOWN:           {extractability_counts['UNKNOWN']}")
 
     print(
         f"\nSaved structured output to:\n{OUTPUT_FILE}\n"
     )
+
+    # -----------------------------------------------------
+    # PRINT SOURCES
+    # -----------------------------------------------------
 
     for i, source in enumerate(
         output.sources,
@@ -251,17 +367,18 @@ ICP classification.
     ):
 
         print(f"{i}. {source.source_name}")
-        print(f"   ICP relevance: {source.icp_relevance}")
-        print(f"   Jurisdiction: {source.jurisdiction}")
-        print(f"   Authority: {source.authority}")
-        print(f"   Type: {source.source_type}")
-        print(f"   URL: {source.source_url}")
+        print(f"   ICP relevance:  {source.icp_relevance}")
+        print(f"   Extractability: {source.extractability}")
+        print(f"   Jurisdiction:   {source.jurisdiction}")
+        print(f"   Authority:      {source.authority}")
+        print(f"   Type:           {source.source_type}")
+        print(f"   URL:            {source.source_url}")
         print(
             f"   Contains haulers: "
             f"{source.likely_contains_haulers}"
         )
-        print(f"   Confidence: {source.confidence:.2f}")
-        print(f"   Why: {source.rationale}")
+        print(f"   Confidence:     {source.confidence:.2f}")
+        print(f"   Why:            {source.rationale}")
         print()
 
 
