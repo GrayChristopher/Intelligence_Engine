@@ -6,37 +6,48 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 from agents import Agent, Runner, WebSearchTool
+from openai import RateLimitError
 
 
-# ---------------------------------------------------------
+# =========================================================
 # CONFIG
-# ---------------------------------------------------------
+# =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 
-INPUT_FILE = DATA_DIR / "accepted_sources.json"
+INPUT_FILE = DATA_DIR / "extractable_sources.json"
 OUTPUT_FILE = DATA_DIR / "discovered_companies.json"
 
 MODEL = "gpt-5.6-luna"
 
-TARGET_SOURCE_KEYWORD = "Orange County Licensed Commercial Hauler"
-
+# Keep the live demo fast.
+MAX_SOURCES = 2
 MAX_COMPANIES_PER_SOURCE = 5
-MAX_TOTAL_COMPANIES = 5
+
+MAX_ATTEMPTS_PER_SOURCE = 2
+ATTEMPT_TIMEOUT_SECONDS = 90
+RETRY_WAIT_SECONDS = 15
+
+# Small pause between successful source calls.
+INTER_SOURCE_DELAY_SECONDS = 5
 
 
-# ---------------------------------------------------------
+# =========================================================
 # STRUCTURED OUTPUT
-# ---------------------------------------------------------
+# =========================================================
 
-class CompanyCandidate(BaseModel):
+class CompanyRecord(BaseModel):
+
     company_name: str
+
     location: Optional[str] = None
     phone: Optional[str] = None
     website: Optional[str] = None
 
-    service_lines: list[str] = Field(default_factory=list)
+    service_lines: list[str] = Field(
+        default_factory=list
+    )
 
     source_name: str
     source_url: str
@@ -44,89 +55,104 @@ class CompanyCandidate(BaseModel):
     confidence: float = Field(
         ge=0.0,
         le=1.0,
-        description=(
-            "Confidence that this company is genuinely supported "
-            "by the authoritative source as a relevant waste hauler."
-        )
     )
 
     evidence: str
 
 
-class SourceExtractionResult(BaseModel):
+class CompanyExtractionResult(BaseModel):
+
     source_name: str
     source_url: str
-    companies: list[CompanyCandidate]
+
+    companies: list[CompanyRecord]
 
 
-# ---------------------------------------------------------
-# AGENT
-# ---------------------------------------------------------
+# =========================================================
+# EXTRACTION AGENT
+# =========================================================
 
-company_extraction_agent = Agent(
+company_agent = Agent(
+
     name="Waste Hauler Company Extraction Agent",
 
     model=MODEL,
 
     instructions="""
-You extract real private-sector waste-hauling companies from authoritative
-government or regulatory sources.
+You are the company-extraction layer of a waste-hauler intelligence system.
 
-You will receive ONE previously validated source.
+You will receive ONE authoritative government source that has already been
+classified as suitable for company extraction.
 
-Your job is to identify actual private-sector waste-hauling companies
-supported by that source.
+Your job is to identify actual PRIVATE hauling companies supported by that
+source.
 
-TARGET COMPANY TYPES:
+The source URL should be treated as the primary evidence.
+
+
+=========================================================
+TARGET COMPANIES
+=========================================================
+
+Include private operators involved in:
 
 - roll-off hauling
 - dumpster service
-- residential waste collection
 - commercial waste collection
-- front-load service
-- rear-load service
+- residential waste collection
+- front-load collection
+- rear-load collection
 - recycling hauling
-- permitted private waste hauling
-- licensed private waste hauling
-- franchised private waste collection
+- mixed solid-waste hauling
+- franchised municipal collection
+- permitted or licensed solid-waste hauling
 
-DO NOT RETURN:
+
+=========================================================
+DO NOT INCLUDE
+=========================================================
+
+Exclude:
 
 - government sanitation departments
-- municipalities or counties themselves
 - landfills with no hauling operation
 - transfer stations with no hauling operation
 - equipment manufacturers
-- brokers with no hauling operation
-- hazardous-only operators
-- waste-tire-only operators
-- duplicates
-- parser artifacts
+- waste brokers with no hauling operation
+- hazardous-waste-only operators
+- tire-only operators
+- clearly unrelated businesses
 
-RULES:
 
-1. The supplied authoritative source must be the primary evidence.
+=========================================================
+DATA RULES
+=========================================================
 
-2. Use web search if necessary to locate the actual list, PDF, or
-   supporting government page.
+Use the authoritative source as the basis for company identification.
 
-3. Do not invent companies.
+Do not invent companies.
 
-4. Do not invent websites, phone numbers, locations, or service lines.
+Do not invent phone numbers.
 
-5. If a field cannot be verified, return null or an empty list.
+Do not invent websites.
 
-6. Return no more than the requested number of companies.
+Do not invent service lines.
 
-7. Prefer distinct private hauling companies.
+If a field cannot be reasonably verified, return null or an empty list.
 
-8. Confidence should reflect how strongly the source supports inclusion.
+A company can still be returned when phone or website is unknown.
 
-9. Evidence should identify why the company was included and reference
-   the authoritative source.
+For every company, provide short evidence explaining why the company
+belongs in the result.
 
-10. If the authoritative source does not actually provide identifiable
-    company records, return an empty companies list.
+Evidence should identify what the authoritative source supports.
+
+Do not infer detailed company capabilities unless supported by evidence.
+
+Return no more than the requested maximum number of companies.
+
+If the source cannot be reliably accessed or does not actually contain
+company records, return an empty company list rather than guessing.
 
 Return structured output only.
 """,
@@ -135,325 +161,617 @@ Return structured output only.
         WebSearchTool()
     ],
 
-    output_type=SourceExtractionResult,
+    output_type=CompanyExtractionResult,
 )
 
 
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
+# =========================================================
+# NORMALIZATION / DEDUPE
+# =========================================================
 
-def normalize_company_name(name: str) -> str:
-    name = name.lower().strip()
+def normalize_text(value):
 
-    name = re.sub(
-        r"\b(llc|l\.l\.c\.|inc|incorporated|corp|corporation|ltd)\b",
-        "",
-        name,
+    if not value:
+        return ""
+
+    value = value.lower().strip()
+
+    value = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        value,
     )
 
-    name = re.sub(r"[^a-z0-9]+", " ", name)
-    name = re.sub(r"\s+", " ", name)
-
-    return name.strip()
-
-
-def company_dedupe_key(company: CompanyCandidate) -> str:
-    location = (company.location or "").lower().strip()
-
-    return (
-        normalize_company_name(company.company_name)
-        + "|"
-        + location
+    value = re.sub(
+        r"\s+",
+        " ",
+        value,
     )
 
+    return value.strip()
 
-def select_target_source(accepted_sources: list[dict]) -> dict:
-    matches = [
-        source
-        for source in accepted_sources
-        if TARGET_SOURCE_KEYWORD.lower()
-        in source["source_name"].lower()
-    ]
 
-    if not matches:
-        available = "\n".join(
-            f"- {source['source_name']}"
-            for source in accepted_sources
-        )
+def company_key(company):
 
-        raise ValueError(
-            f"No accepted source matched:\n"
-            f"{TARGET_SOURCE_KEYWORD}\n\n"
-            f"Available accepted sources:\n"
-            f"{available}"
-        )
-
-    # If more than one matches, prefer highest-confidence source.
-    matches.sort(
-        key=lambda source: source["confidence"],
-        reverse=True
+    name = normalize_text(
+        company.get("company_name")
     )
 
-    return matches[0]
-
-
-# ---------------------------------------------------------
-# EXTRACT SOURCE
-# ---------------------------------------------------------
-
-async def extract_source(source: dict) -> SourceExtractionResult:
-
-    print()
-    print("-" * 70)
-    print(f"Extracting: {source['source_name']}")
-    print(f"URL: {source['source_url']}")
-    print(f"Confidence: {source['confidence']:.2f}")
-    print("-" * 70)
-
-    prompt = f"""
-Extract a maximum of {MAX_COMPANIES_PER_SOURCE} real waste-hauling companies
-from this validated authoritative source.
-
-SOURCE NAME:
-{source["source_name"]}
-
-SOURCE URL:
-{source["source_url"]}
-
-JURISDICTION:
-{source["jurisdiction"]}
-
-AUTHORITY:
-{source["authority"]}
-
-SOURCE TYPE:
-{source["source_type"]}
-
-ICP RELEVANCE:
-{source["icp_relevance"]}
-
-SOURCE DISCOVERY RATIONALE:
-{source["rationale"]}
-
-The authoritative source above must be the primary evidence for company
-inclusion.
-
-Return at most {MAX_COMPANIES_PER_SOURCE} companies.
-
-If the source does not actually contain identifiable company records,
-return zero companies rather than guessing.
-"""
-
-    result = await Runner.run(
-        company_extraction_agent,
-        prompt
+    location = normalize_text(
+        company.get("location")
     )
 
-    return result.final_output
+    return f"{name}|{location}"
 
 
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
+def deduplicate_companies(companies):
 
-async def main():
+    unique = {}
+    duplicates = 0
 
-    if not INPUT_FILE.exists():
-        raise FileNotFoundError(
-            f"Missing input file: {INPUT_FILE}"
-        )
+    for company in companies:
 
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
-        accepted_sources = json.load(f)
+        key = company_key(company)
 
-    if not accepted_sources:
-        raise ValueError(
-            "accepted_sources.json contains no sources."
-        )
+        if not key:
+            continue
 
-    target_source = select_target_source(
-        accepted_sources
-    )
+        if key in unique:
 
-    print("\nCOMPANY EXTRACTION TEST")
-    print("=" * 70)
+            duplicates += 1
 
-    print(
-        f"Accepted sources available: "
-        f"{len(accepted_sources)}"
-    )
-
-    print(
-        f"Target source keyword:      "
-        f"{TARGET_SOURCE_KEYWORD}"
-    )
-
-    print(
-        f"Selected source:            "
-        f"{target_source['source_name']}"
-    )
-
-    print(
-        f"Max companies:              "
-        f"{MAX_TOTAL_COMPANIES}"
-    )
-
-    # -----------------------------------------------------
-    # AGENTIC EXTRACTION
-    # -----------------------------------------------------
-
-    extraction = await extract_source(
-        target_source
-    )
-
-    all_companies = extraction.companies[
-        :MAX_TOTAL_COMPANIES
-    ]
-
-    print(
-        f"\nAgent returned "
-        f"{len(all_companies)} companies."
-    )
-
-    # -----------------------------------------------------
-    # DETERMINISTIC DEDUPLICATION
-    # -----------------------------------------------------
-
-    unique_companies = {}
-
-    for company in all_companies:
-
-        key = company_dedupe_key(company)
-
-        if key not in unique_companies:
-            unique_companies[key] = company
+            # Keep whichever record has higher confidence.
+            if (
+                company.get("confidence", 0)
+                > unique[key].get("confidence", 0)
+            ):
+                unique[key] = company
 
         else:
-            existing = unique_companies[key]
+            unique[key] = company
 
-            if company.confidence > existing.confidence:
-                unique_companies[key] = company
+    return list(unique.values()), duplicates
 
-    final_companies = list(
-        unique_companies.values()
-    )
 
-    final_companies = final_companies[
-        :MAX_TOTAL_COMPANIES
-    ]
+# =========================================================
+# CHECKPOINT
+# =========================================================
 
-    # -----------------------------------------------------
-    # SAVE
-    # -----------------------------------------------------
+def save_checkpoint(
+    state,
+    companies,
+    processed_sources,
+):
 
-    output = {
-        "target_source": {
-            "source_name": target_source["source_name"],
-            "source_url": target_source["source_url"],
-            "jurisdiction": target_source["jurisdiction"],
-            "confidence": target_source["confidence"],
-        },
-        "companies_before_deduplication": len(
-            all_companies
-        ),
-        "companies_after_deduplication": len(
-            final_companies
-        ),
-        "companies": [
-            company.model_dump()
-            for company in final_companies
-        ],
+    payload = {
+        "state": state,
+        "processed_sources": processed_sources,
+        "companies": companies,
     }
 
     with open(
         OUTPUT_FILE,
         "w",
-        encoding="utf-8"
-    ) as f:
+        encoding="utf-8",
+    ) as file:
+
         json.dump(
-            output,
-            f,
+            payload,
+            file,
             indent=2,
-            ensure_ascii=False
+            ensure_ascii=False,
         )
 
-    # -----------------------------------------------------
+
+# =========================================================
+# EXTRACT ONE SOURCE
+# =========================================================
+
+async def extract_source(
+    state,
+    source,
+):
+
+    source_name = source.get(
+        "source_name",
+        "UNKNOWN",
+    )
+
+    source_url = source.get(
+        "source_url",
+        "",
+    )
+
+    jurisdiction = source.get(
+        "jurisdiction",
+        "UNKNOWN",
+    )
+
+    authority = source.get(
+        "authority",
+        "UNKNOWN",
+    )
+
+    prompt = f"""
+Extract private waste-hauling companies from this authoritative source.
+
+STATE:
+{state}
+
+SOURCE NAME:
+{source_name}
+
+SOURCE URL:
+{source_url}
+
+JURISDICTION:
+{jurisdiction}
+
+AUTHORITY:
+{authority}
+
+SOURCE CLASSIFICATION:
+{source.get("extractability")}
+
+Return at most {MAX_COMPANIES_PER_SOURCE} companies.
+
+Use the supplied authoritative source as the primary evidence.
+
+Do not guess.
+
+If the source does not actually provide identifiable companies,
+return an empty company list.
+"""
+
+    for attempt in range(
+        1,
+        MAX_ATTEMPTS_PER_SOURCE + 1,
+    ):
+
+        print()
+        print(
+            f"   Extraction attempt "
+            f"{attempt}/{MAX_ATTEMPTS_PER_SOURCE}..."
+        )
+
+        try:
+
+            result = await asyncio.wait_for(
+
+                Runner.run(
+                    company_agent,
+                    prompt,
+                ),
+
+                timeout=ATTEMPT_TIMEOUT_SECONDS,
+            )
+
+            return result.final_output
+
+        except asyncio.TimeoutError:
+
+            print(
+                "   Attempt timed out."
+            )
+
+            if (
+                attempt
+                == MAX_ATTEMPTS_PER_SOURCE
+            ):
+                return None
+
+            print(
+                f"   Retrying in "
+                f"{RETRY_WAIT_SECONDS} seconds..."
+            )
+
+            await asyncio.sleep(
+                RETRY_WAIT_SECONDS
+            )
+
+        except RateLimitError:
+
+            print(
+                "   OpenAI rate limit reached."
+            )
+
+            if (
+                attempt
+                == MAX_ATTEMPTS_PER_SOURCE
+            ):
+                return None
+
+            print(
+                f"   Retrying in "
+                f"{RETRY_WAIT_SECONDS} seconds..."
+            )
+
+            await asyncio.sleep(
+                RETRY_WAIT_SECONDS
+            )
+
+        except Exception as exc:
+
+            text = str(exc).lower()
+
+            if (
+                "429" in text
+                or "rate limit" in text
+                or "tokens per min" in text
+            ):
+
+                print(
+                    "   OpenAI rate limit detected."
+                )
+
+                if (
+                    attempt
+                    == MAX_ATTEMPTS_PER_SOURCE
+                ):
+                    return None
+
+                print(
+                    f"   Retrying in "
+                    f"{RETRY_WAIT_SECONDS} seconds..."
+                )
+
+                await asyncio.sleep(
+                    RETRY_WAIT_SECONDS
+                )
+
+            else:
+
+                print(
+                    f"   Extraction error: {exc}"
+                )
+
+                return None
+
+    return None
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+async def main():
+
+    print()
+    print("=" * 72)
+    print("HAULER INTELLIGENCE ENGINE")
+    print("COMPANY EXTRACTION")
+    print("=" * 72)
+
+    if not INPUT_FILE.exists():
+
+        raise FileNotFoundError(
+            f"Missing input file: {INPUT_FILE}"
+        )
+
+    with open(
+        INPUT_FILE,
+        "r",
+        encoding="utf-8",
+    ) as file:
+
+        payload = json.load(file)
+
+    state = payload.get(
+        "state",
+        "UNKNOWN",
+    )
+
+    sources = payload.get(
+        "sources",
+        [],
+    )
+
+    if not sources:
+
+        print()
+        print(
+            "No extractable sources were provided."
+        )
+
+        return
+
+    selected_sources = sources[
+        :MAX_SOURCES
+    ]
+
+    print()
+    print(
+        f"State: {state}"
+    )
+
+    print(
+        f"Extractable sources available: "
+        f"{len(sources)}"
+    )
+
+    print(
+        f"Sources selected for this run: "
+        f"{len(selected_sources)}"
+    )
+
+    print(
+        f"Maximum companies per source: "
+        f"{MAX_COMPANIES_PER_SOURCE}"
+    )
+
+    all_companies = []
+
+    processed_sources = []
+
+    # =====================================================
+    # PROCESS SOURCES SEQUENTIALLY
+    # =====================================================
+
+    for index, source in enumerate(
+        selected_sources,
+        start=1,
+    ):
+
+        print()
+        print("=" * 72)
+
+        print(
+            f"SOURCE {index}/"
+            f"{len(selected_sources)}"
+        )
+
+        print(
+            source.get(
+                "source_name",
+                "UNKNOWN",
+            )
+        )
+
+        print(
+            source.get(
+                "source_url",
+                "",
+            )
+        )
+
+        print("=" * 72)
+
+        result = await extract_source(
+            state,
+            source,
+        )
+
+        processed_record = {
+            "source_name": source.get(
+                "source_name"
+            ),
+            "source_url": source.get(
+                "source_url"
+            ),
+        }
+
+        if result is None:
+
+            print()
+            print(
+                "   Source extraction failed "
+                "or timed out."
+            )
+
+            processed_record[
+                "status"
+            ] = "FAILED"
+
+            processed_record[
+                "companies_found"
+            ] = 0
+
+            processed_sources.append(
+                processed_record
+            )
+
+            save_checkpoint(
+                state,
+                all_companies,
+                processed_sources,
+            )
+
+            continue
+
+        companies = [
+            company.model_dump()
+            for company
+            in result.companies
+        ]
+
+        print()
+        print(
+            f"   Companies found: "
+            f"{len(companies)}"
+        )
+
+        for company in companies:
+
+            all_companies.append(
+                company
+            )
+
+            print(
+                f"   + "
+                f"{company['company_name']}"
+            )
+
+        processed_record[
+            "status"
+        ] = "SUCCESS"
+
+        processed_record[
+            "companies_found"
+        ] = len(companies)
+
+        processed_sources.append(
+            processed_record
+        )
+
+        # Save after every successful source.
+        save_checkpoint(
+            state,
+            all_companies,
+            processed_sources,
+        )
+
+        # Small breathing room between API calls.
+        if (
+            index
+            < len(selected_sources)
+        ):
+
+            print()
+            print(
+                f"Waiting "
+                f"{INTER_SOURCE_DELAY_SECONDS} "
+                f"seconds before next source..."
+            )
+
+            await asyncio.sleep(
+                INTER_SOURCE_DELAY_SECONDS
+            )
+
+    # =====================================================
+    # DEDUPE
+    # =====================================================
+
+    before_dedupe = len(
+        all_companies
+    )
+
+    unique_companies, duplicates = (
+        deduplicate_companies(
+            all_companies
+        )
+    )
+
+    after_dedupe = len(
+        unique_companies
+    )
+
+    # =====================================================
+    # FINAL SAVE
+    # =====================================================
+
+    final_payload = {
+        "state": state,
+        "processed_sources": processed_sources,
+        "companies_before_dedup": before_dedupe,
+        "duplicates_removed": duplicates,
+        "companies_after_dedup": after_dedupe,
+        "companies": unique_companies,
+    }
+
+    with open(
+        OUTPUT_FILE,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            final_payload,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    # =====================================================
     # SUMMARY
-    # -----------------------------------------------------
+    # =====================================================
 
-    print("\nCOMPANY EXTRACTION COMPLETE")
-    print("=" * 70)
+    print()
+    print("=" * 72)
+    print("COMPANY EXTRACTION COMPLETE")
+    print("=" * 72)
 
+    print()
     print(
-        f"Source processed: "
-        f"{target_source['source_name']}"
+        f"State: {state}"
     )
 
     print(
-        f"Companies before deduplication: "
-        f"{output['companies_before_deduplication']}"
+        f"Sources processed: "
+        f"{len(processed_sources)}"
     )
 
     print(
-        f"Companies after deduplication:  "
-        f"{output['companies_after_deduplication']}"
+        f"Companies before dedupe: "
+        f"{before_dedupe}"
     )
 
     print(
-        f"\nSaved structured output to:\n"
-        f"{OUTPUT_FILE}\n"
+        f"Duplicates removed: "
+        f"{duplicates}"
     )
 
-    print("DISCOVERED COMPANIES")
-    print("-" * 70)
+    print(
+        f"Companies after dedupe: "
+        f"{after_dedupe}"
+    )
 
-    for i, company in enumerate(
-        final_companies,
-        start=1
+    print()
+
+    for number, company in enumerate(
+        unique_companies,
+        start=1,
     ):
 
         print(
-            f"{i}. {company.company_name}"
+            f"{number}. "
+            f"{company['company_name']}"
         )
 
         print(
             f"   Location: "
-            f"{company.location or 'UNKNOWN'}"
-        )
-
-        print(
-            f"   Website: "
-            f"{company.website or 'UNKNOWN'}"
+            f"{company.get('location') or 'UNKNOWN'}"
         )
 
         print(
             f"   Phone: "
-            f"{company.phone or 'UNKNOWN'}"
+            f"{company.get('phone') or 'UNKNOWN'}"
+        )
+
+        print(
+            f"   Website: "
+            f"{company.get('website') or 'UNKNOWN'}"
         )
 
         print(
             f"   Services: "
-            f"{', '.join(company.service_lines) if company.service_lines else 'UNKNOWN'}"
+            f"{', '.join(company.get('service_lines', [])) or 'UNKNOWN'}"
         )
 
         print(
             f"   Confidence: "
-            f"{company.confidence:.2f}"
+            f"{company.get('confidence', 0):.2f}"
         )
 
         print(
             f"   Source: "
-            f"{company.source_name}"
+            f"{company.get('source_name')}"
         )
 
         print(
             f"   Evidence: "
-            f"{company.evidence}"
+            f"{company.get('evidence')}"
         )
 
         print()
 
+    print(
+        f"Saved to: {OUTPUT_FILE}"
+    )
+
+    print()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(
+        main()
+    )
