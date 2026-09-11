@@ -5,13 +5,20 @@ import sys
 import time
 from pathlib import Path
 
+from config import MODE, MODEL, SETTINGS
+
 
 # =========================================================
-# CONFIG
+# PATHS
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+
+
+# =========================================================
+# PIPELINE
+# =========================================================
 
 STAGES = [
     ("01", "AI Source Discovery", "01_source_discovery_agent.py"),
@@ -42,34 +49,99 @@ def stage_header(number, name):
     print()
 
 
+def print_mode():
+
+    print()
+    print(f"Mode:  {MODE.upper()}")
+    print(f"Model: {MODEL}")
+
+    print()
+
+    if MODE == "demo":
+
+        print("Demo configuration:")
+        print(
+            f"  Source target:              "
+            f"{SETTINGS['source_target']}"
+        )
+        print(
+            f"  Extraction sources:         "
+            f"{SETTINGS['max_extraction_sources']}"
+        )
+        print(
+            f"  Companies per source:       "
+            f"{SETTINGS['max_companies_per_source']}"
+        )
+        print(
+            f"  Companies researched:       "
+            f"{SETTINGS['max_enrichment_companies']}"
+        )
+
+    else:
+
+        print("Full configuration:")
+        print(
+            f"  Source target:              "
+            f"{SETTINGS['source_target']}"
+        )
+        print(
+            f"  Extraction sources:         "
+            f"{SETTINGS['max_extraction_sources']}"
+        )
+        print(
+            f"  Companies per source:       "
+            f"{SETTINGS['max_companies_per_source']}"
+        )
+        print(
+            f"  Companies researched:       "
+            f"{SETTINGS['max_enrichment_companies']}"
+        )
+
+    print()
+
+
 # =========================================================
 # RUN STAGE
 # =========================================================
 
 def run_stage(number, name, script):
-    stage_header(number, name)
+
+    stage_header(
+        number,
+        name,
+    )
 
     script_path = BASE_DIR / script
 
     if not script_path.exists():
-        print(f"ERROR: Missing {script}")
+
+        print(
+            f"ERROR: Missing pipeline script: "
+            f"{script}"
+        )
+
         return False
 
     start = time.time()
 
     result = subprocess.run(
-        [sys.executable, str(script_path)],
+        [
+            sys.executable,
+            str(script_path),
+        ],
         cwd=BASE_DIR,
     )
 
     elapsed = time.time() - start
 
     if result.returncode != 0:
+
         print()
         print(
             f"STAGE {number} FAILED "
             f"after {elapsed:.1f}s"
         )
+
         return False
 
     print()
@@ -82,39 +154,61 @@ def run_stage(number, name, script):
 
 
 # =========================================================
-# READ OUTPUT HELPERS
+# JSON HELPERS
 # =========================================================
 
 def load_json(filename):
+
     path = DATA_DIR / filename
 
     if not path.exists():
         return {}
 
     try:
+
         with open(
             path,
             "r",
             encoding="utf-8",
         ) as file:
+
             return json.load(file)
 
     except Exception:
         return {}
 
 
-def count_sources(filename):
-    payload = load_json(filename)
-    return len(payload.get("sources", []))
+def get_list(
+    payload,
+    *keys,
+):
+
+    for key in keys:
+
+        value = payload.get(key)
+
+        if isinstance(value, list):
+            return value
+
+    return []
 
 
 # =========================================================
-# FINAL SUMMARY
+# SUMMARY
 # =========================================================
 
 def print_summary():
+
     discovered = load_json(
         "discovered_sources.json"
+    )
+
+    extractable = load_json(
+        "extractable_sources.json"
+    )
+
+    resolution = load_json(
+        "resolution_sources.json"
     )
 
     extracted = load_json(
@@ -142,125 +236,199 @@ def print_summary():
         or "UNKNOWN"
     )
 
-    sources_discovered = len(
-        discovered.get("sources", [])
+    discovered_sources = get_list(
+        discovered,
+        "sources",
     )
 
-    sources_extractable = count_sources(
-        "extractable_sources.json"
+    extractable_sources = get_list(
+        extractable,
+        "sources",
     )
 
-    sources_resolution = count_sources(
-        "resolution_sources.json"
+    resolution_sources = get_list(
+        resolution,
+        "sources",
     )
 
-    companies_extracted = len(
-        extracted.get("companies", [])
+    extracted_companies = get_list(
+        extracted,
+        "companies",
     )
 
-    companies_available = enriched.get(
-        "companies_available",
-        companies_extracted,
+    enriched_companies = get_list(
+        enriched,
+        "companies",
     )
 
-    companies_researched = enriched.get(
-        "companies_researched",
-        len(enriched.get("companies", [])),
-    )
-
-    enriched_statuses = enriched.get(
+    processed_research = get_list(
+        enriched,
         "processed",
-        [],
+    )
+
+    validated_companies = get_list(
+        validated,
+        "validated",
+        "companies",
+    )
+
+    review_companies = get_list(
+        validated,
+        "review",
+    )
+
+    rejected_companies = get_list(
+        validated,
+        "rejected",
+    )
+
+    ranked_companies = get_list(
+        ranked,
+        "companies",
+        "ranked_companies",
     )
 
     successfully_enriched = sum(
         1
-        for item in enriched_statuses
+        for item in processed_research
         if item.get("status") == "ENRICHED"
     )
 
-    companies_validated = validated.get(
-        "validated_count",
-        len(validated.get("validated", [])),
+    retained_original = sum(
+        1
+        for item in processed_research
+        if item.get("status")
+        == "ORIGINAL_RETAINED"
     )
 
-    companies_review = validated.get(
-        "review_count",
-        len(validated.get("review", [])),
+    header(
+        "HAULER INTELLIGENCE ENGINE | RUN SUMMARY"
     )
 
-    companies_rejected = validated.get(
-        "rejected_count",
-        len(validated.get("rejected", [])),
+    print()
+    print(f"State:                      {state}")
+    print(f"Mode:                       {MODE.upper()}")
+    print(f"Model:                      {MODEL}")
+
+    print()
+
+    print(
+        f"Sources discovered:         "
+        f"{len(discovered_sources)}"
     )
 
-    ranked_companies = ranked.get(
-        "companies",
-        [],
+    print(
+        f"Sources extractable:        "
+        f"{len(extractable_sources)}"
     )
 
-    header("HAULER INTELLIGENCE ENGINE | RUN COMPLETE")
+    print(
+        f"Sources needing resolution: "
+        f"{len(resolution_sources)}"
+    )
 
     print()
-    print(f"State:                     {state}")
+
+    print(
+        f"Companies extracted:        "
+        f"{len(extracted_companies)}"
+    )
+
+    print(
+        f"Companies researched:       "
+        f"{len(enriched_companies)}"
+    )
+
+    print(
+        f"Successfully enriched:      "
+        f"{successfully_enriched}"
+    )
+
+    print(
+        f"Original records retained:  "
+        f"{retained_original}"
+    )
+
     print()
-    print(f"Sources discovered:        {sources_discovered}")
-    print(f"Sources extractable:       {sources_extractable}")
-    print(f"Sources needing resolution:{sources_resolution:>8}")
-    print()
-    print(f"Companies extracted:       {companies_extracted}")
-    print(f"Companies available:       {companies_available}")
-    print(f"Companies researched:      {companies_researched}")
-    print(f"Successfully enriched:     {successfully_enriched}")
-    print()
-    print(f"Companies validated:       {companies_validated}")
-    print(f"Companies for review:      {companies_review}")
-    print(f"Companies rejected:        {companies_rejected}")
-    print(f"Companies ranked:          {len(ranked_companies)}")
+
+    print(
+        f"Companies validated:        "
+        f"{len(validated_companies)}"
+    )
+
+    print(
+        f"Companies for review:       "
+        f"{len(review_companies)}"
+    )
+
+    print(
+        f"Companies rejected:         "
+        f"{len(rejected_companies)}"
+    )
+
+    print(
+        f"Companies ranked:           "
+        f"{len(ranked_companies)}"
+    )
 
     if ranked_companies:
+
         print()
         print("TOP ICP RESULTS")
         print("-" * 76)
 
-        for company in ranked_companies[:5]:
-            rank = company.get("rank", "?")
+        for index, company in enumerate(
+            ranked_companies[:5],
+            start=1,
+        ):
+
+            rank = company.get(
+                "rank",
+                index,
+            )
+
             name = company.get(
                 "company_name",
                 "UNKNOWN",
             )
-            score = company.get(
-                "score_total",
-                0,
+
+            score = (
+                company.get("score_total")
+                or company.get("total_score")
+                or company.get("score")
+                or 0
             )
 
             print(
                 f"#{rank:<3} "
-                f"{name:<40} "
+                f"{name:<42} "
                 f"{score}/100"
             )
 
     print()
-    print("OUTPUTS")
+    print("FINAL OUTPUT")
     print("-" * 76)
+
     print(
         "JSON: data/ranked_companies.json"
     )
+
     print(
         "CSV:  data/ranked_companies.csv"
     )
+
     print()
 
 
 # =========================================================
-# PIPELINE
+# MAIN
 # =========================================================
 
 def main():
+
     parser = argparse.ArgumentParser(
         description=(
-            "Run the Hauler Intelligence Engine "
-            "end-to-end."
+            "Run the Hauler Intelligence Engine."
         )
     )
 
@@ -285,28 +453,35 @@ def main():
         "--summary-only",
         action="store_true",
         help=(
-            "Display the latest pipeline outputs "
-            "without making API calls."
+            "Display the latest outputs without "
+            "running any pipeline stages."
         ),
     )
 
     args = parser.parse_args()
 
-    header("HAULER INTELLIGENCE ENGINE")
+    header(
+        "HAULER INTELLIGENCE ENGINE"
+    )
 
     print()
     print(
         "Agentic research + deterministic "
-        "validation and scoring"
+        "validation and ICP scoring"
     )
 
+    print_mode()
+
     if args.summary_only:
+
         print_summary()
         return
 
     start_index = next(
         index
-        for index, stage in enumerate(STAGES)
+        for index, stage in enumerate(
+            STAGES
+        )
         if stage[0] == args.from_stage
     )
 
@@ -325,14 +500,29 @@ def main():
         )
 
         if not success:
+
             print()
             print(
                 "Pipeline stopped safely."
             )
+
             print(
-                "Existing successful outputs "
-                "have been retained."
+                "Previously completed outputs "
+                "remain intact."
             )
+
+            print()
+            print(
+                "You can inspect the latest "
+                "successful state with:"
+            )
+
+            print(
+                "python run_demo.py --summary-only"
+            )
+
+            print()
+
             sys.exit(1)
 
     elapsed = (
@@ -346,6 +536,7 @@ def main():
         f"Pipeline runtime: "
         f"{elapsed:.1f} seconds"
     )
+
     print()
 
 
