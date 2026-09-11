@@ -20,9 +20,10 @@ OUTPUT_FILE = DATA_DIR / "discovered_companies.json"
 
 MODEL = "gpt-5.6-luna"
 
-MAX_SOURCES = 3
-MAX_COMPANIES_PER_SOURCE = 10
-MAX_TOTAL_COMPANIES = 25
+# Small prototype limits to avoid rate-limit issues
+MAX_SOURCES = 1
+MAX_COMPANIES_PER_SOURCE = 5
+MAX_TOTAL_COMPANIES = 5
 
 
 # ---------------------------------------------------------
@@ -32,7 +33,6 @@ MAX_TOTAL_COMPANIES = 25
 class CompanyCandidate(BaseModel):
     company_name: str
     location: Optional[str] = None
-
     phone: Optional[str] = None
     website: Optional[str] = None
 
@@ -44,7 +44,10 @@ class CompanyCandidate(BaseModel):
     confidence: float = Field(
         ge=0.0,
         le=1.0,
-        description="Confidence that this company is actually identified by the source as a waste-hauling operator."
+        description=(
+            "Confidence that this company is genuinely supported "
+            "by the authoritative source as a relevant waste hauler."
+        )
     )
 
     evidence: str
@@ -57,7 +60,7 @@ class SourceExtractionResult(BaseModel):
 
 
 # ---------------------------------------------------------
-# EXTRACTION AGENT
+# AGENT
 # ---------------------------------------------------------
 
 company_extraction_agent = Agent(
@@ -66,18 +69,14 @@ company_extraction_agent = Agent(
     model=MODEL,
 
     instructions="""
-You extract real waste-hauling companies from authoritative public sources.
+You extract real private-sector waste-hauling companies from authoritative
+government or regulatory sources.
 
-You will receive ONE previously validated government or regulatory source.
+You will receive ONE previously validated source.
 
-Your job is to identify actual private-sector waste-hauling operators
-supported by that source.
+Your task is to identify actual companies supported by that source.
 
----------------------------------------------------------
-TARGET COMPANY TYPES
----------------------------------------------------------
-
-Prioritize companies involved in:
+TARGET COMPANY TYPES:
 
 - roll-off hauling
 - dumpster service
@@ -86,54 +85,43 @@ Prioritize companies involved in:
 - front-load service
 - rear-load service
 - recycling hauling
-- franchised solid-waste collection
-- permitted or licensed private waste hauling
+- permitted private waste hauling
+- licensed private waste hauling
+- franchised private waste collection
 
----------------------------------------------------------
-DO NOT RETURN
----------------------------------------------------------
-
-Do not return:
+DO NOT RETURN:
 
 - government sanitation departments
-- counties or municipalities themselves
+- municipalities or counties themselves
 - landfills with no hauling operation
 - transfer stations with no hauling operation
 - equipment manufacturers
 - brokers with no hauling operation
 - hazardous-only operators
-- tire-only operators
-- obvious parser artifacts
+- waste-tire-only operators
+- obvious duplicates or parser artifacts
 
----------------------------------------------------------
-RESEARCH RULES
----------------------------------------------------------
+RULES:
 
-1. Start with the supplied source and its URL.
+1. Use the supplied authoritative source as the primary evidence.
 
-2. Use web search when necessary to:
-   - locate the actual list or document
-   - confirm the company name
-   - resolve basic details
+2. You may use web search to locate the actual list, PDF, permit page,
+   or supporting page.
 
-3. Never invent a company.
+3. Do not invent companies.
 
-4. Never invent phone numbers, websites, locations, or service lines.
+4. Do not invent websites, phone numbers, locations, or service lines.
 
 5. If a field cannot be verified, return null or an empty list.
 
-6. The supplied government source must be the primary evidence that the
-   company belongs in this candidate universe.
+6. Return no more than the requested maximum number of companies.
 
-7. Do not substitute generic Google results for source evidence.
+7. Prefer distinct private hauling companies.
 
-8. Return no more than the requested maximum number of companies.
+8. Confidence should reflect how strongly the authoritative source supports
+   the company's inclusion.
 
-9. Prefer distinct private hauling companies over duplicate locations,
-   DBAs, departments, or administrative records.
-
-10. Confidence should represent confidence that the company genuinely
-    appears to be a relevant hauler supported by the authoritative source.
+9. Keep evidence concise and specific.
 
 Return structured output only.
 """,
@@ -151,15 +139,12 @@ Return structured output only.
 # ---------------------------------------------------------
 
 def normalize_company_name(name: str) -> str:
-    """
-    Basic deterministic normalization used only for deduplication.
-    """
     name = name.lower().strip()
 
     name = re.sub(
         r"\b(llc|l\.l\.c\.|inc|incorporated|corp|corporation|ltd)\b",
         "",
-        name
+        name,
     )
 
     name = re.sub(r"[^a-z0-9]+", " ", name)
@@ -191,7 +176,8 @@ async def extract_source(source: dict) -> SourceExtractionResult:
     print("-" * 70)
 
     prompt = f"""
-Extract waste-hauling companies from this previously validated source.
+Extract a maximum of {MAX_COMPANIES_PER_SOURCE} real waste-hauling companies
+from this validated source.
 
 SOURCE NAME:
 {source["source_name"]}
@@ -211,12 +197,12 @@ SOURCE TYPE:
 ICP RELEVANCE:
 {source["icp_relevance"]}
 
-SOURCE DISCOVERY RATIONALE:
+SOURCE RATIONALE:
 {source["rationale"]}
 
-Return a maximum of {MAX_COMPANIES_PER_SOURCE} real companies.
+The authoritative source must be the primary evidence for inclusion.
 
-The authoritative source above must be the primary evidence for inclusion.
+Return at most {MAX_COMPANIES_PER_SOURCE} companies.
 """
 
     result = await Runner.run(
@@ -250,17 +236,12 @@ async def main():
 
     print("\nCOMPANY EXTRACTION TEST")
     print("=" * 70)
-
     print(f"Accepted sources available: {len(accepted_sources)}")
     print(f"Sources being tested:       {len(test_sources)}")
     print(f"Max companies per source:   {MAX_COMPANIES_PER_SOURCE}")
     print(f"Global company cap:         {MAX_TOTAL_COMPANIES}")
 
     all_companies = []
-
-    # -----------------------------------------------------
-    # AGENTIC EXTRACTION
-    # -----------------------------------------------------
 
     for source in test_sources:
 
@@ -271,8 +252,7 @@ async def main():
             f"{len(extraction.companies)} companies."
         )
 
-        for company in extraction.companies:
-            all_companies.append(company)
+        all_companies.extend(extraction.companies)
 
         if len(all_companies) >= MAX_TOTAL_COMPANIES:
             break
@@ -293,16 +273,14 @@ async def main():
         else:
             existing = unique_companies[key]
 
-            # Keep whichever record has higher confidence.
             if company.confidence > existing.confidence:
                 unique_companies[key] = company
 
     final_companies = list(unique_companies.values())
-
     final_companies = final_companies[:MAX_TOTAL_COMPANIES]
 
     # -----------------------------------------------------
-    # SAVE OUTPUT
+    # SAVE
     # -----------------------------------------------------
 
     output = {
@@ -312,7 +290,7 @@ async def main():
         "companies": [
             company.model_dump()
             for company in final_companies
-        ]
+        ],
     }
 
     with open(
@@ -331,8 +309,7 @@ async def main():
     # SUMMARY
     # -----------------------------------------------------
 
-    print("\n")
-    print("COMPANY EXTRACTION COMPLETE")
+    print("\nCOMPANY EXTRACTION COMPLETE")
     print("=" * 70)
 
     print(
@@ -363,45 +340,35 @@ async def main():
         start=1
     ):
 
-        print(
-            f"{i}. {company.company_name}"
-        )
-
+        print(f"{i}. {company.company_name}")
         print(
             f"   Location: "
             f"{company.location or 'UNKNOWN'}"
         )
-
         print(
             f"   Website: "
             f"{company.website or 'UNKNOWN'}"
         )
-
         print(
             f"   Phone: "
             f"{company.phone or 'UNKNOWN'}"
         )
-
         print(
             f"   Services: "
             f"{', '.join(company.service_lines) if company.service_lines else 'UNKNOWN'}"
         )
-
         print(
             f"   Confidence: "
             f"{company.confidence:.2f}"
         )
-
         print(
             f"   Source: "
             f"{company.source_name}"
         )
-
         print(
             f"   Evidence: "
             f"{company.evidence}"
         )
-
         print()
 
 
