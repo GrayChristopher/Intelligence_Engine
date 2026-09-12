@@ -32,38 +32,54 @@ class ResearchResult(BaseModel):
 def load_companies():
     if not INPUT_FILE.exists():
         raise FileNotFoundError(f"Missing input file: {INPUT_FILE}")
+
     with open(INPUT_FILE, "r", encoding="utf-8") as file:
         return json.load(file)
 
 
-def save_checkpoint(state, companies_available, companies_researched, companies, processed):
+def save_checkpoint(
+    state,
+    companies_available,
+    research_target,
+    companies,
+    processed,
+):
     payload = {
         "state": state,
         "mode": MODE,
         "model": MODEL,
         "companies_available": companies_available,
-        "companies_researched": companies_researched,
+        "research_target": research_target,
         "companies": companies,
         "processed": processed,
     }
+
     temp_file = OUTPUT_FILE.with_suffix(".json.tmp")
+
     with open(temp_file, "w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2, ensure_ascii=False)
+
     os.replace(temp_file, OUTPUT_FILE)
 
 
 def clean_list(values):
     seen = set()
     result = []
+
     for value in values or []:
         text = str(value).strip()
+
         if not text:
             continue
+
         key = text.lower()
+
         if key in seen:
             continue
+
         seen.add(key)
         result.append(text)
+
     return result
 
 
@@ -165,45 +181,87 @@ async def research_company(agent, state: str, company: dict):
     )
 
 
+def normalize_source_backed_record(company: dict):
+    """
+    Preserve the source-backed extraction record in the canonical schema.
+    Used both for researched and non-researched companies.
+    """
+    record = dict(company)
+
+    record["source_name"] = company.get("source_name")
+    record["source_url"] = company.get("source_url")
+    record["source_evidence"] = company.get("source_evidence")
+    record["discovery_confidence"] = float(
+        company.get("discovery_confidence", 0.0) or 0.0
+    )
+
+    if record.get("service_lines") is None:
+        record["service_lines"] = []
+
+    return record
+
+
 def merge_company(original: dict, research: dict):
     """
     Preserve the authoritative discovery record and add research on top of it.
     Discovery provenance is never replaced by research output.
     """
-    merged = dict(original)
+    merged = normalize_source_backed_record(original)
 
     merged["company_name"] = original.get("company_name")
 
     for field in ["location", "phone", "website"]:
         value = research.get(field)
+
         if value:
             merged[field] = value
 
-    original_services = clean_list(original.get("service_lines", []))
-    researched_services = clean_list(research.get("service_lines", []))
-    merged["service_lines"] = clean_list(original_services + researched_services)
+    original_services = clean_list(
+        original.get("service_lines", [])
+    )
+    researched_services = clean_list(
+        research.get("service_lines", [])
+    )
+
+    merged["service_lines"] = clean_list(
+        original_services + researched_services
+    )
 
     merged["size_signal"] = research.get("size_signal")
-    merged["size_signal_type"] = research.get("size_signal_type")
+    merged["size_signal_type"] = research.get(
+        "size_signal_type"
+    )
     merged["research_confidence"] = float(
         research.get("research_confidence", 0.0) or 0.0
     )
     merged["research_evidence"] = research.get("evidence")
 
-    # Canonical discovery provenance. Keep these exact names throughout
-    # downstream validation and scoring.
-    merged["source_name"] = original.get("source_name")
-    merged["source_url"] = original.get("source_url")
-    merged["source_evidence"] = original.get("source_evidence")
-    merged["discovery_confidence"] = float(
-        original.get("discovery_confidence", 0.0) or 0.0
-    )
-
     return merged
+
+
+def retain_original(company: dict, status: str):
+    """
+    Keep an extracted source-backed company in the pipeline even when it
+    is not selected for enrichment or research is unavailable.
+    """
+    record = normalize_source_backed_record(company)
+
+    record["size_signal"] = record.get("size_signal")
+    record["size_signal_type"] = record.get("size_signal_type")
+    record["research_confidence"] = float(
+        record.get("research_confidence", 0.0) or 0.0
+    )
+    record["research_evidence"] = record.get(
+        "research_evidence"
+    )
+    record["research_status"] = status
+
+    return record
 
 
 def is_daily_rate_limit(exc: Exception) -> bool:
     text = str(exc).lower()
+
     return (
         "requests per day" in text
         or "requests_per_day" in text
@@ -220,29 +278,42 @@ async def main():
     print("=" * 72)
 
     payload = load_companies()
+
     state = payload.get("state", "UNKNOWN")
     companies = payload.get("companies", [])
-    selected = companies[: SETTINGS["max_enrichment_companies"]]
+
+    research_target = min(
+        len(companies),
+        SETTINGS["max_enrichment_companies"],
+    )
+
+    selected = companies[:research_target]
+    unselected = companies[research_target:]
 
     print()
     print(f"State: {state}")
     print(f"Companies available: {len(companies)}")
     print(f"Companies selected for research: {len(selected)}")
+    print(
+        f"Companies passing through without research: "
+        f"{len(unselected)}"
+    )
     print(f"Model: {MODEL}")
     print()
 
-    if not selected:
-        print("No companies available for research.")
-        return
-
     agent = create_agent()
+
     enriched_companies = []
     processed = []
+
     max_attempts = SETTINGS["max_attempts"]
     daily_limit_hit = False
 
     for index, company in enumerate(selected, start=1):
-        company_name = company.get("company_name", "UNKNOWN")
+        company_name = company.get(
+            "company_name",
+            "UNKNOWN",
+        )
 
         print()
         print("-" * 72)
@@ -257,28 +328,51 @@ async def main():
             print(f"Attempt {attempt}/{max_attempts}")
 
             try:
-                result = await research_company(agent, state, company)
+                result = await research_company(
+                    agent,
+                    state,
+                    company,
+                )
+
                 research = result.final_output.model_dump()
-                merged = merge_company(company, research)
+                merged = merge_company(
+                    company,
+                    research,
+                )
+
+                merged["research_status"] = "ENRICHED"
 
                 enriched_companies.append(merged)
+
                 processed.append(
                     {
                         "company_name": company_name,
                         "status": "ENRICHED",
                         "research_confidence": research.get(
-                            "research_confidence", 0.0
+                            "research_confidence",
+                            0.0,
                         ),
                     }
                 )
 
                 print("Research completed.")
-                print(f"Website: {merged.get('website') or 'UNKNOWN'}")
-                print(f"Phone: {merged.get('phone') or 'UNKNOWN'}")
-                print(f"Size signal: {merged.get('size_signal') or 'UNKNOWN'}")
                 print(
-                    f"Confidence: {merged.get('research_confidence', 0):.2f}"
+                    f"Website: "
+                    f"{merged.get('website') or 'UNKNOWN'}"
                 )
+                print(
+                    f"Phone: "
+                    f"{merged.get('phone') or 'UNKNOWN'}"
+                )
+                print(
+                    f"Size signal: "
+                    f"{merged.get('size_signal') or 'UNKNOWN'}"
+                )
+                print(
+                    f"Confidence: "
+                    f"{merged.get('research_confidence', 0):.2f}"
+                )
+
                 success = True
                 break
 
@@ -287,36 +381,43 @@ async def main():
 
             except Exception as exc:
                 message = str(exc)
-                print(f"Research failed: {message[:300]}")
+
+                print(
+                    f"Research failed: "
+                    f"{message[:300]}"
+                )
+
                 if is_daily_rate_limit(exc):
                     print()
                     print("DAILY MODEL RATE LIMIT REACHED")
-                    print("Completed research has been checkpointed.")
-                    print("Remaining companies will retain their source-backed records.")
+                    print(
+                        "Completed research has been checkpointed."
+                    )
+                    print(
+                        "Remaining companies will retain their "
+                        "source-backed records."
+                    )
+
                     daily_limit_hit = True
                     break
 
             if attempt < max_attempts:
                 wait_seconds = SETTINGS["retry_wait"]
-                print(f"Retrying in {wait_seconds} seconds...")
+
+                print(
+                    f"Retrying in {wait_seconds} seconds..."
+                )
+
                 await asyncio.sleep(wait_seconds)
 
         if not success:
-            fallback = dict(company)
-            fallback["size_signal"] = None
-            fallback["size_signal_type"] = None
-            fallback["research_confidence"] = 0.0
-            fallback["research_evidence"] = None
-
-            # Normalize canonical discovery provenance even on fallback.
-            fallback["source_name"] = company.get("source_name")
-            fallback["source_url"] = company.get("source_url")
-            fallback["source_evidence"] = company.get("source_evidence")
-            fallback["discovery_confidence"] = float(
-                company.get("discovery_confidence", 0.0) or 0.0
+            fallback = retain_original(
+                company,
+                "ORIGINAL_RETAINED",
             )
 
             enriched_companies.append(fallback)
+
             processed.append(
                 {
                     "company_name": company_name,
@@ -326,60 +427,97 @@ async def main():
             )
 
             print()
-            print("Research unavailable. Original source-backed record retained.")
+            print(
+                "Research unavailable. "
+                "Original source-backed record retained."
+            )
 
         save_checkpoint(
             state=state,
             companies_available=len(companies),
-            companies_researched=len(selected),
+            research_target=research_target,
             companies=enriched_companies,
             processed=processed,
         )
 
         if daily_limit_hit:
-            # Preserve all unprocessed source-backed records so downstream
-            # deterministic validation can still operate.
-            remaining = selected[index:]
-            for remaining_company in remaining:
-                fallback = dict(remaining_company)
-                fallback["size_signal"] = None
-                fallback["size_signal_type"] = None
-                fallback["research_confidence"] = 0.0
-                fallback["research_evidence"] = None
-                fallback["source_name"] = remaining_company.get("source_name")
-                fallback["source_url"] = remaining_company.get("source_url")
-                fallback["source_evidence"] = remaining_company.get("source_evidence")
-                fallback["discovery_confidence"] = float(
-                    remaining_company.get("discovery_confidence", 0.0) or 0.0
+            remaining_selected = selected[index:]
+
+            for remaining_company in remaining_selected:
+                fallback = retain_original(
+                    remaining_company,
+                    "ORIGINAL_RETAINED",
                 )
+
                 enriched_companies.append(fallback)
+
                 processed.append(
                     {
-                        "company_name": remaining_company.get(
-                            "company_name", "UNKNOWN"
+                        "company_name": (
+                            remaining_company.get(
+                                "company_name",
+                                "UNKNOWN",
+                            )
                         ),
                         "status": "ORIGINAL_RETAINED",
                         "research_confidence": 0.0,
                     }
                 )
 
-            save_checkpoint(
-                state=state,
-                companies_available=len(companies),
-                companies_researched=len(selected),
-                companies=enriched_companies,
-                processed=processed,
-            )
             break
 
         if index < len(selected):
-            await asyncio.sleep(SETTINGS["inter_company_delay"])
+            await asyncio.sleep(
+                SETTINGS["inter_company_delay"]
+            )
+
+    # CRITICAL:
+    # Every extracted company must continue downstream.
+    # Companies not selected for paid/agentic enrichment are preserved here.
+    for company in unselected:
+        passthrough = retain_original(
+            company,
+            "NOT_SELECTED_FOR_RESEARCH",
+        )
+
+        enriched_companies.append(passthrough)
+
+        processed.append(
+            {
+                "company_name": company.get(
+                    "company_name",
+                    "UNKNOWN",
+                ),
+                "status": "NOT_SELECTED_FOR_RESEARCH",
+                "research_confidence": 0.0,
+            }
+        )
+
+    save_checkpoint(
+        state=state,
+        companies_available=len(companies),
+        research_target=research_target,
+        companies=enriched_companies,
+        processed=processed,
+    )
 
     successful = sum(
-        1 for item in processed if item.get("status") == "ENRICHED"
+        1
+        for item in processed
+        if item.get("status") == "ENRICHED"
     )
+
     retained = sum(
-        1 for item in processed if item.get("status") == "ORIGINAL_RETAINED"
+        1
+        for item in processed
+        if item.get("status") == "ORIGINAL_RETAINED"
+    )
+
+    passthrough_count = sum(
+        1
+        for item in processed
+        if item.get("status")
+        == "NOT_SELECTED_FOR_RESEARCH"
     )
 
     print()
@@ -388,22 +526,56 @@ async def main():
     print("=" * 72)
     print()
     print(f"Companies available: {len(companies)}")
-    print(f"Companies researched/enqueued: {len(selected)}")
+    print(f"Companies selected for research: {len(selected)}")
     print(f"Successfully enriched: {successful}")
-    print(f"Original records retained: {retained}")
+    print(f"Research failures retained: {retained}")
+    print(
+        f"Not selected for research retained: "
+        f"{passthrough_count}"
+    )
+    print(
+        f"Companies passed downstream: "
+        f"{len(enriched_companies)}"
+    )
     print()
 
-    for index, company in enumerate(enriched_companies, start=1):
-        print(f"{index}. {company.get('company_name')}")
-        print(f"   Website: {company.get('website') or 'UNKNOWN'}")
-        print(f"   Size signal: {company.get('size_signal') or 'UNKNOWN'}")
+    for index, company in enumerate(
+        enriched_companies[:20],
+        start=1,
+    ):
+        print(
+            f"{index}. "
+            f"{company.get('company_name')}"
+        )
+        print(
+            f"   Research status: "
+            f"{company.get('research_status')}"
+        )
+        print(
+            f"   Website: "
+            f"{company.get('website') or 'UNKNOWN'}"
+        )
+        print(
+            f"   Size signal: "
+            f"{company.get('size_signal') or 'UNKNOWN'}"
+        )
         print(
             f"   Research confidence: "
             f"{company.get('research_confidence', 0):.2f}"
         )
         print()
 
-    print(f"Saved: {OUTPUT_FILE.relative_to(BASE_DIR)}")
+    if len(enriched_companies) > 20:
+        print(
+            f"... {len(enriched_companies) - 20} additional "
+            "companies retained in output."
+        )
+        print()
+
+    print(
+        f"Saved: "
+        f"{OUTPUT_FILE.relative_to(BASE_DIR)}"
+    )
     print()
 
 
