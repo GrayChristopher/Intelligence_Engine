@@ -1,7 +1,4 @@
-from pathlib import Path
-import py_compile
-
-code = r'''import argparse
+import argparse
 import json
 import subprocess
 import sys
@@ -238,9 +235,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
-
-path = Path("/mnt/data/run_demo_clean.py")
-path.write_text(code, encoding="utf-8")
-py_compile.compile(str(path), doraise=True)
-print("Clean runner created and syntax checked:", path)
