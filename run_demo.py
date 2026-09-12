@@ -10,7 +10,6 @@ from config import MODEL, MODE, SETTINGS
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-
 STAGES = [
     ("01", "AI Source Discovery", "01_source_discovery_agent.py"),
     ("02", "Deterministic Source Routing", "02_validate_sources.py"),
@@ -121,11 +120,13 @@ def print_summary(runtime=None):
         for item in processed
         if isinstance(item, dict) and item.get("status") == "ENRICHED"
     )
+
     research_failures_retained = sum(
         1
         for item in processed
         if isinstance(item, dict) and item.get("status") == "ORIGINAL_RETAINED"
     )
+
     unresearched_retained = sum(
         1
         for item in processed
@@ -178,7 +179,7 @@ def print_summary(runtime=None):
 
         for index, company in enumerate(companies[:10], start=1):
             name = company.get("company_name", "UNKNOWN")
-            score = company.get("total_score", company.get("score", 0))
+            score = company.get("score_total", 0)
             print(f"#{index:<3} {score:>3}/100  {name}")
 
     if runtime is not None:
