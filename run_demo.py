@@ -1,8 +1,6 @@
 from pathlib import Path
 import py_compile
 
-src = Path("/mnt/data/run_demo.py")
-# Reconstruct the known current runner with only the summary label made accurate.
 code = r'''import argparse
 import json
 import subprocess
@@ -120,6 +118,7 @@ def print_summary(runtime=None):
     downstream_companies = count_list(enriched, "companies")
 
     processed = enriched.get("processed", []) if isinstance(enriched, dict) else []
+
     successfully_enriched = sum(
         1
         for item in processed
@@ -130,7 +129,7 @@ def print_summary(runtime=None):
         for item in processed
         if isinstance(item, dict) and item.get("status") == "ORIGINAL_RETAINED"
     )
-    not_selected_retained = sum(
+    unresearched_retained = sum(
         1
         for item in processed
         if isinstance(item, dict)
@@ -147,26 +146,26 @@ def print_summary(runtime=None):
     print("HAULER INTELLIGENCE ENGINE | RUN SUMMARY")
     print("=" * 76)
     print()
-    print(f"State:                      {state}")
-    print(f"Mode:                       {MODE.upper()}")
-    print(f"Model:                      {MODEL}")
+    print(f"State:                       {state}")
+    print(f"Mode:                        {MODE.upper()}")
+    print(f"Model:                       {MODEL}")
     print()
-    print(f"Sources discovered:         {source_count('discovered_sources.json')}")
-    print(f"Sources extractable:        {source_count('extractable_sources.json')}")
-    print(f"Sources needing resolution: {source_count('resolution_sources.json')}")
-    print(f"Sources for review:         {source_count('review_sources.json')}")
-    print(f"Sources rejected:           {source_count('rejected_sources.json')}")
+    print(f"Sources discovered:          {source_count('discovered_sources.json')}")
+    print(f"Sources extractable:         {source_count('extractable_sources.json')}")
+    print(f"Sources needing resolution:  {source_count('resolution_sources.json')}")
+    print(f"Sources for review:          {source_count('review_sources.json')}")
+    print(f"Sources rejected:            {source_count('rejected_sources.json')}")
     print()
-    print(f"Companies extracted:        {extracted_companies}")
-    print(f"Companies passed downstream:{downstream_companies:>4}")
-    print(f"Successfully enriched:      {successfully_enriched}")
-    print(f"Research failures retained: {research_failures_retained}")
-    print(f"Unresearched retained:      {not_selected_retained}")
+    print(f"Companies extracted:         {extracted_companies}")
+    print(f"Companies passed downstream: {downstream_companies}")
+    print(f"Successfully enriched:       {successfully_enriched}")
+    print(f"Research failures retained:  {research_failures_retained}")
+    print(f"Unresearched retained:       {unresearched_retained}")
     print()
-    print(f"Companies validated:        {validated_companies}")
-    print(f"Companies for review:       {review_companies}")
-    print(f"Companies rejected:         {rejected_companies}")
-    print(f"Companies ranked:           {ranked_companies}")
+    print(f"Companies validated:         {validated_companies}")
+    print(f"Companies for review:        {review_companies}")
+    print(f"Companies rejected:          {rejected_companies}")
+    print(f"Companies ranked:            {ranked_companies}")
     print()
     print("FINAL OUTPUT")
     print("-" * 76)
@@ -240,6 +239,8 @@ def main():
 if __name__ == "__main__":
     main()
 '''
-src.write_text(code, encoding="utf-8")
-py_compile.compile(str(src), doraise=True)
-print(src)
+
+path = Path("/mnt/data/run_demo_clean.py")
+path.write_text(code, encoding="utf-8")
+py_compile.compile(str(path), doraise=True)
+print("Clean runner created and syntax checked:", path)
